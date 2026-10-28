@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IsPackable>false</IsPackable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenVisionLab.Vision3D" Version="$(PackageVersion)" />
+    <PackageReference Include="OpenVisionLab.Inspection" Version="$(PackageVersion)" />
+    <PackageReference Include="OpenVisionLab.Vision2D.Blob" Version="$(PackageVersion)" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,144 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.423
+
+      - name: Select unique package version from source version
+        shell: pwsh
+        run: |
+          [xml] $versionProps = Get-Content -LiteralPath Directory.Build.props -Raw
+          $sourceVersion = [string] $versionProps.Project.PropertyGroup.Version
+          $packageVersion = "$($sourceVersion.Split('-')[0])-ci.$env:GITHUB_RUN_NUMBER.$env:GITHUB_RUN_ATTEMPT"
+          "PACKAGE_VERSION=$packageVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore quality tools
+        run: dotnet tool restore
+
+      - name: Restore
+        run: dotnet restore OpenVisionLab.VisionSdk.sln
+
+      - name: Build
+        run: dotnet build OpenVisionLab.VisionSdk.sln -c Release --no-restore
+
+      - name: Smoke 2D and 3D with coverage gate
+        shell: pwsh
+        run: |
+          foreach ($name in @('OVL_CUDA_TEST_MODULE', 'OVL_CUDA_EXECUTION_FIXTURES', 'OVL_COMPUTE_TEST_MODULES', 'OVL_COMPUTE_REAL_PROBE')) {
+            [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+          }
+          ./eng/Verify-Coverage.ps1 `
+            -SmokeAssembly tests/OpenVisionLab.Inspection.Smoke/bin/Release/net8.0/OpenVisionLab.Inspection.Smoke.dll `
+            -OutputPath "$env:RUNNER_TEMP/openvisionlab-coverage.cobertura.xml" `
+            -SmokeReportPath "$env:RUNNER_TEMP/openvisionlab-smoke.json"
+
+      - name: Exercise coverage fail-closed guards
+        shell: pwsh
+        run: |
+          ./eng/Test-CoverageNegative.ps1 `
+            -SmokeAssembly tests/OpenVisionLab.Inspection.Smoke/bin/Release/net8.0/OpenVisionLab.Inspection.Smoke.dll `
+            -CoveragePath "$env:RUNNER_TEMP/openvisionlab-coverage.cobertura.xml" `
+            -SmokeReportPath "$env:RUNNER_TEMP/openvisionlab-smoke.json" `
+            -OutputDirectory "$env:RUNNER_TEMP/openvisionlab-coverage-negative"
+
+      - name: Preserve managed coverage and smoke execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-coverage-and-smoke
+          path: |
+            ${{ runner.temp }}/openvisionlab-coverage.cobertura.xml
+            ${{ runner.temp }}/openvisionlab-smoke.json
+            ${{ runner.temp }}/openvisionlab-coverage-negative
+          if-no-files-found: error
+
+      - name: Verify public API compatibility
+        shell: pwsh
+        run: ./eng/Verify-PublicApi.ps1 -AssemblyDirectory tests/OpenVisionLab.Inspection.Smoke/bin/Release/net8.0
+
+      - name: Verify analyzer no-regression baseline
+        shell: pwsh
+        run: ./eng/Verify-AnalyzerBaseline.ps1 -SolutionPath OpenVisionLab.VisionSdk.sln -ArtifactsPath "$env:RUNNER_TEMP/openvisionlab-analyzer"
+
+      - name: Pack
+        run: dotnet pack OpenVisionLab.VisionSdk.sln -c Release --no-build -o artifacts/packages "-p:PackageVersion=$env:PACKAGE_VERSION"
+
+      - name: Verify package provenance and documentation
+        shell: pwsh
+        run: |
+          ./eng/Verify-PackageProvenance.ps1 `
+            -PackageDirectory artifacts/packages `
+            -ExpectedVersion $env:PACKAGE_VERSION `
+            -ExpectedCommit $env:GITHUB_SHA `
+            -RequireCleanWorktree
+
+      - name: Exercise package provenance fail-closed guards
+        shell: pwsh
+        run: |
+          ./eng/Test-PackageProvenanceNegative.ps1 `
+            -PackageDirectory artifacts/packages `
+            -ExpectedVersion $env:PACKAGE_VERSION `
+            -ExpectedCommit $env:GITHUB_SHA `
+            -OutputDirectory "$env:RUNNER_TEMP/openvisionlab-package-provenance-negative-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+
+      - name: Run package-only .NET Framework 4.8 consumer
+        shell: pwsh
+        run: |
+          ./eng/Test-NetFrameworkPackageConsumer.ps1 `
+            -PackageDirectory artifacts/packages `
+            -ExpectedVersion $env:PACKAGE_VERSION `
+            -DependencySource https://api.nuget.org/v3/index.json `
+            -OutputDirectory "$env:RUNNER_TEMP/openvisionlab-framework-consumer-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+
+      - name: Preserve Framework consumer execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: framework-package-consumer
+          path: |
+            ${{ runner.temp }}/openvisionlab-framework-consumer-${{ github.run_id }}-${{ github.run_attempt }}/reports
+            ${{ runner.temp }}/openvisionlab-framework-consumer-${{ github.run_id }}-${{ github.run_attempt }}/consumer/NuGet.Config
+          if-no-files-found: error
+
+      - name: Restore package-only consumer
+        run: dotnet restore tests/OpenVisionLab.PackageConsumer.Smoke/OpenVisionLab.PackageConsumer.Smoke.csproj "-p:PackageVersion=$env:PACKAGE_VERSION" "-p:RestorePackagesPath=$env:RUNNER_TEMP\openvisionlab-package-consumer-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --configfile "$env:RUNNER_TEMP/openvisionlab-framework-consumer-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT/consumer/NuGet.Config"
+
+      - name: Run package-only 2D and 3D consumer
+        run: dotnet run --project tests/OpenVisionLab.PackageConsumer.Smoke/OpenVisionLab.PackageConsumer.Smoke.csproj -c Release --no-restore "-p:PackageVersion=$env:PACKAGE_VERSION" "-p:RestorePackagesPath=$env:RUNNER_TEMP\openvisionlab-package-consumer-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+
+      - name: Verify one Windows x64 native runtime copy
+        shell: pwsh
+        run: |
+          $outputRoot = 'tests/OpenVisionLab.PackageConsumer.Smoke/bin/Release/net8.0/win-x64'
+          if (-not (Test-Path -LiteralPath $outputRoot -PathType Container)) {
+            throw "Missing package consumer output root: $outputRoot"
+          }
+          $nativeFiles = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -Filter OpenCvSharpExtern.dll -File)
+          if ($nativeFiles.Count -ne 1) {
+            throw "Expected one OpenCvSharpExtern.dll under $outputRoot, found $($nativeFiles.Count)."
+          }
+          $expectedNativePath = [System.IO.Path]::GetFullPath((Join-Path $outputRoot 'OpenCvSharpExtern.dll'))
+          if ($nativeFiles[0].FullName -ne $expectedNativePath) {
+            throw "Expected the native DLL at $expectedNativePath, found $($nativeFiles[0].FullName)."
+          }

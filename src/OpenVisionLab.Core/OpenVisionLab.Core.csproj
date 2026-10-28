@@ -1,0 +1,61 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Platforms>AnyCPU;x64</Platforms>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <PackageDescription>Common utilities and OpenCV runtime assets for OpenVisionLab.</PackageDescription>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Required by the vendored netstandard2.0 OpenCvSharp assembly. -->
+    <PackageReference Include="System.Memory" Version="4.5.4" />
+    <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="4.7.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="DLL\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="OpenCvSharp">
+      <HintPath>DLL\OpenCvSharp.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="README.md" Pack="true" PackagePath="" />
+    <None Include="DLL\OpenCvSharp.dll" Pack="true" PackagePath="lib\netstandard2.0\" />
+    <None Include="DLL\OpenCvSharpExtern.dll" Pack="true" PackagePath="runtimes\win-x64\native\" />
+    <None Include="build\OpenVisionLab.Core.targets" Pack="true" PackagePath="buildTransitive\" />
+    <None Include="ThirdParty\provenance.json" Pack="true" PackagePath="third-party\" />
+    <None Include="ThirdParty\NOTICE.md" Pack="true" PackagePath="third-party\" />
+    <None Include="ThirdParty\licenses\OpenCvSharp-BSD-3-Clause.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-4.3-BSD-3-Clause.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-Contrib-BSD-3-Clause.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-dnn-torch-COPYRIGHT.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-ittnotify-BSD-3-Clause.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-libjasper-copyright.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-libjasper-LICENSE.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-libjpeg-turbo-LICENSE.md" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\README.ijg" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-libpng-LICENSE.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-libtiff-COPYRIGHT.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-libwebp-COPYING.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-openexr-LICENSE.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-protobuf-LICENSE.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-quirc-LICENSE.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-SoftFloat-COPYING.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\OpenCV-zlib-README.txt" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\licenses\Intel-IPPICV-2020-Simplified-Software-License.rtf" Pack="true" PackagePath="third-party\licenses\" />
+    <None Include="ThirdParty\evidence\OpenCV-ittnotify-dual-license-header.txt" Pack="true" PackagePath="third-party\evidence\" />
+    <None Include="ThirdParty\evidence\Intel-IPPICV-2020-third-party-programs.txt" Pack="true" PackagePath="third-party\evidence\" />
+  </ItemGroup>
+
+</Project>
+

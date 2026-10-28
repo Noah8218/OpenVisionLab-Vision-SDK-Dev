@@ -1,0 +1,5952 @@
+using OpenVisionLab.Compute;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Globalization;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using OpenVisionLab.Vision2D.Property;
+using OpenVisionLab.Vision2D.Result;
+using OpenCvSharp;
+
+namespace OpenVisionLab.Vision2D.Tool
+{
+    public sealed class EdgeBasedTemplateMatchingTool : OpenCvAlgorithmBase, ICancellableVisionTool
+    {
+        public IOpenCVPropertyEdgeBasedTemplateMatching property;
+        public List<MatchingResult> results = new List<MatchingResult>();
+
+        private const int PositionRefineSeedCount = 3;
+        private const int ParallelModelThreshold = 2;
+        private const int ParallelPositionThreshold = 4096;
+        private const int MinimumCudaGridPositions = 32768;
+        private const int HybridCandidateGridColumns = 4;
+        private const int HybridCandidateGridRows = 4;
+        private const int HybridCandidateGridTopK = 2;
+        private const int HybridProposalDownscaleSourcePixels = 120000;
+        private const int HybridProposalDownscaleTargetPixels = 80000;
+        private const int HybridProposalMinScaledTemplateSize = 24;
+        private const int HybridProposalScaledTopK = 2;
+        private const int HybridProposalMinRefineRadius = 6;
+        private const double HybridProposalFastPathMinImageScore = 0.985D;
+        private const double HybridProposalFastPathMinEdgeScore = 0.70D;
+        private const double HybridEdgeDescriptorWeight = 0.15D;
+        private const double HybridDescriptorImageTieMargin = 0.02D;
+        private const double PyramidPositionProposalScale = 0.5D;
+        private const int PyramidPositionProposalMinTemplateSize = 16;
+        private const int PyramidPositionProposalRefineRadius = 6;
+        private const double PyramidPositionProposalWeakVerifiedMargin = 0.03D;
+        private const double CandidateAmbiguityScoreGapThreshold = 0.03D;
+        private const double CandidateAmbiguityDistanceFactor = 0.35D;
+        private const int UniqueMatchMinimumInternalTopK = 8;
+        private const int ModelSmallTemplateMinDimension = 24;
+        private const int ModelLowEdgePointThreshold = 40;
+        private const double ModelLowCoverageAreaThreshold = 0.15D;
+        private const double ModelLowQuadrantBalanceThreshold = 0.20D;
+        private const double ModelScaleSearchCoverageWarningThreshold = 0.35D;
+        private const int ModelPyramidMaxDiagnosticLevels = 6;
+        private const int ModelPyramidMinUsableDimension = 16;
+        private readonly VisionComputeSession computeSession;
+        private ComputeExecutionEvidence computeEvidence;
+        private readonly EdgeTemplateModelStore modelStore;
+        private readonly EdgeCandidateSearch candidateSearch;
+        private readonly EdgeHybridCandidateSearch hybridSearch;
+        private readonly EdgeMatchDecision matchDecision;
+        private readonly Dictionary<string, double> phaseElapsedMs = new Dictionary<string, double>(StringComparer.Ordinal);
+        private readonly object phaseElapsedSync = new object();
+        private CandidateDiagnostics candidateDiagnostics = new CandidateDiagnostics();
+        private VisionToolErrorCode lastMatchingErrorCode = VisionToolErrorCode.MatchingNoResult;
+        private string lastMatchingMessage = "Edge based template matching found no result.";
+        private CancellationToken CurrentCancellationToken => ExecutionCancellationToken;
+
+        internal const double DefaultPoseMatchMinScoreMargin = 0.03D;
+        internal const double DefaultPoseMatchMinAngleDifference = 5D;
+        internal const double DefaultPoseMatchMinRelativeScaleDifference = 0.05D;
+
+        public bool UsePoseUniquenessValidation { get; set; }
+        public double PoseMatchMinScoreMargin { get; set; } = DefaultPoseMatchMinScoreMargin;
+        public double PoseMatchMinAngleDifferenceDegrees { get; set; } = DefaultPoseMatchMinAngleDifference;
+        public double PoseMatchMinRelativeScaleDifference { get; set; } = DefaultPoseMatchMinRelativeScaleDifference;
+        internal const int DefaultPoseRefinementMaximumIterations = 40;
+        internal const double DefaultPoseRefinementEpsilon = 0.000001D;
+        public bool UsePoseRefinement { get; set; }
+        public int PoseRefinementMaximumIterations { get; set; } = DefaultPoseRefinementMaximumIterations;
+        public double PoseRefinementEpsilon { get; set; } = DefaultPoseRefinementEpsilon;
+        public bool CollectPhaseTimings { get; set; }
+        public IReadOnlyDictionary<string, double> LastPhaseElapsedMs => phaseElapsedMs;
+
+        public EdgeBasedTemplateMatchingTool() : this(null) { }
+
+        /// <summary>Borrows a host-owned session. Disposing the Tool does not dispose the session.</summary>
+        public EdgeBasedTemplateMatchingTool(VisionComputeSession computeSession)
+        {
+            this.computeSession = computeSession;
+            modelStore = new EdgeTemplateModelStore(this);
+            candidateSearch = new EdgeCandidateSearch(this);
+            hybridSearch = new EdgeHybridCandidateSearch(this);
+            matchDecision = new EdgeMatchDecision(this);
+        }
+
+        public void SetProperty(IOpenCVPropertyEdgeBasedTemplateMatching propertyBase)
+        {
+            property = propertyBase;
+            modelStore.Clear();
+        }
+
+        public void SetTemplateImage(Mat image)
+        {
+            imageTemplate?.Dispose();
+            modelStore.SetTemplate(image);
+            imageTemplate = modelStore.GetTemplateForRun().Clone();
+        }
+
+        /// <summary>Explicitly prepares an immutable base-scale model without executing an inspection. Calls on one Tool must be serialized.</summary>
+        public EdgeTemplateModelArtifact PrepareLearnedModel(string sourceId, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            EdgeTemplateModelArtifactCodec.ValidateText(sourceId, nameof(sourceId));
+            ValidateLearningConfiguration();
+            Mat template = GetTemplateForRun();
+            if (OpenCvHelper.IsImageEmpty(template) || template.Depth() != MatType.CV_8U
+                || (template.Channels() != 1 && template.Channels() != 3 && template.Channels() != 4)
+                || (long)template.Width * template.Height > EdgeTemplateModelArtifactCodec.MaximumPixelCount)
+                throw new InvalidOperationException("Model preparation requires a bounded nonempty 8-bit gray, BGR or BGRA template.");
+            TemplateModelCache cache = modelStore.GetTemplateModelCache(cancellationToken);
+            EdgeTemplateModel model = cache.Model;
+            EdgeTemplateModelPoint[] points = new EdgeTemplateModelPoint[model.Points.Count];
+            for (int i = 0; i < points.Length; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                TemplateEdgePoint point = model.Points[i];
+                points[i] = new EdgeTemplateModelPoint(point.X, point.Y, point.UnitDx, point.UnitDy, point.InvMagnitude);
+            }
+            return new EdgeTemplateModelArtifact(sourceId, modelStore.CreateLearningParameters(), model.Width, model.Height,
+                template.Channels(), model.Center.X, model.Center.Y, model.RawPointCount, points,
+                CopyRaster(template, cancellationToken), CopyRaster(cache.PreparedTemplate, cancellationToken), cancellationToken);
+        }
+
+        /// <summary>Atomically restores learned base edges into owned native images without running matching. Non-base scale variants remain lazy.</summary>
+        public void SetLearnedModel(EdgeTemplateModelArtifact artifact, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (artifact == null) throw new ArgumentNullException(nameof(artifact));
+            ValidateLearningConfiguration();
+            if (!string.Equals(artifact.LearningParameters, modelStore.CreateLearningParameters(), StringComparison.Ordinal))
+                throw new ArgumentException("Learned edge model parameters differ from the Tool learning configuration.", nameof(artifact));
+            modelStore.Restore(artifact, cancellationToken);
+        }
+
+        private void ValidateLearningConfiguration()
+        {
+            if (property == null) throw new InvalidOperationException("Set the learning configuration before preparing or restoring a model.");
+            if (!IsFinite(property.MIN_GRADIENT_MAGNITUDE) || property.MIN_GRADIENT_MAGNITUDE < 0D
+                || !IsFinite(property.THRESHOLD) || !IsFinite(property.ADAPTIVE_THRESHOLD)
+                || property.MAX_TEMPLATE_POINTS < 1 || property.MAX_TEMPLATE_POINTS > EdgeTemplateModelArtifactCodec.MaximumPointCount
+                || !TryValidateAdaptiveThreshold(property, VisionToolErrorCode.MatchingInvalidAdaptiveBlockSize, out _, out _))
+                throw new ArgumentException("Learned model configuration requires finite learning values, a bounded positive point count and a valid active adaptive block size.");
+        }
+
+        private static byte[] CopyRaster(Mat image, CancellationToken cancellationToken)
+        {
+            int rowLength = checked(image.Width * image.Channels());
+            byte[] bytes = new byte[checked(rowLength * image.Height)];
+            for (int row = 0; row < image.Height; row++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Marshal.Copy(image.Ptr(row), bytes, row * rowLength, rowLength);
+            }
+            return bytes;
+        }
+
+        private static Mat RestoreRaster(int width, int height, int channels, byte[] bytes, CancellationToken cancellationToken)
+        {
+            Mat image = new Mat(height, width, MatType.CV_8UC(channels));
+            try
+            {
+                int rowLength = checked(width * channels);
+                for (int row = 0; row < height; row++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Marshal.Copy(bytes, row * rowLength, image.Ptr(row), rowLength);
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                return image;
+            }
+            catch { image.Dispose(); throw; }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                modelStore.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
+        public override VisionToolResult Execute(Mat source)
+        {
+            results.Clear();
+            computeEvidence = null;
+            ResetCandidateDiagnostics();
+            return AttachDiagnosticEvidence(base.Execute(source), CancellationToken.None);
+        }
+
+        public VisionToolResult Execute(Mat source, CancellationToken cancellationToken)
+        {
+            results.Clear();
+            computeEvidence = null;
+            ResetCandidateDiagnostics();
+            try
+            {
+                return AttachDiagnosticEvidence(ExecuteWithCancellation(source, cancellationToken), cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                results.Clear();
+                computeEvidence = null;
+                throw;
+            }
+        }
+
+        private VisionToolResult AttachDiagnosticEvidence(VisionToolResult result, CancellationToken cancellationToken)
+        {
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (result != null)
+                {
+                    result.EdgeBasedMatchingDiagnostics = CreateDiagnosticEvidence(result);
+                    result.ComputeDiagnostics = computeEvidence;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                return result;
+            }
+            catch
+            {
+                result?.Dispose();
+                throw;
+            }
+        }
+
+        protected override bool TryValidateBeforeRun(out VisionToolErrorCode errorCode, out string message)
+        {
+            if (!base.TryValidateBeforeRun(out errorCode, out message))
+            {
+                return false;
+            }
+
+            if (OpenCvHelper.IsImageEmpty(GetTemplateForRun()))
+            {
+                errorCode = VisionToolErrorCode.MatchingTemplateMissing;
+                message = string.IsNullOrWhiteSpace(property.PATTERN_PATH)
+                    ? "Edge based matching template image is not loaded."
+                    : $"Edge based matching template image is not loaded. Path={property.PATTERN_PATH}.";
+                return false;
+            }
+
+            if (!IsFinite(property.SCORE_MIN) || property.SCORE_MIN < -1 || property.SCORE_MIN > 1)
+            {
+                results.Clear();
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching SCORE_MIN must be finite and between -1 and 1. SCORE_MIN={property.SCORE_MIN}.";
+                return false;
+            }
+
+            if (!IsFinite(property.MIN_GRADIENT_MAGNITUDE) || property.MIN_GRADIENT_MAGNITUDE < 0D)
+            {
+                results.Clear();
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching MIN_GRADIENT_MAGNITUDE must be finite and nonnegative. MIN_GRADIENT_MAGNITUDE={property.MIN_GRADIENT_MAGNITUDE}.";
+                return false;
+            }
+
+            if (property.NUM_MATCH <= 0)
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching NUM_MATCH must be greater than 0. NUM_MATCH={property.NUM_MATCH}.";
+                return false;
+            }
+
+            if (property.USE_UNIQUE_MATCH_VALIDATION && property.NUM_MATCH != 1)
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Unique edge matching requires NUM_MATCH=1. NUM_MATCH={property.NUM_MATCH}.";
+                return false;
+            }
+
+            if (property.USE_UNIQUE_MATCH_VALIDATION && property.USE_MULTI_ROI)
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = "Unique edge matching requires one search region. USE_MULTI_ROI must be false.";
+                return false;
+            }
+
+            if (property.USE_UNIQUE_MATCH_VALIDATION
+                && (double.IsNaN(property.UNIQUE_MATCH_MIN_SCORE_MARGIN)
+                    || double.IsInfinity(property.UNIQUE_MATCH_MIN_SCORE_MARGIN)
+                    || property.UNIQUE_MATCH_MIN_SCORE_MARGIN < 0D
+                    || property.UNIQUE_MATCH_MIN_SCORE_MARGIN > 1D))
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Unique edge matching score margin must be between 0 and 1. Margin={property.UNIQUE_MATCH_MIN_SCORE_MARGIN}.";
+                return false;
+            }
+
+            if (UsePoseUniquenessValidation
+                && (property.NUM_MATCH != 1 || property.USE_MULTI_ROI
+                    || !IsFinite(PoseMatchMinScoreMargin) || PoseMatchMinScoreMargin < 0D || PoseMatchMinScoreMargin > 1D
+                    || !IsFinite(PoseMatchMinAngleDifferenceDegrees) || PoseMatchMinAngleDifferenceDegrees <= 0D || PoseMatchMinAngleDifferenceDegrees > 180D
+                    || !IsFinite(PoseMatchMinRelativeScaleDifference) || PoseMatchMinRelativeScaleDifference <= 0D
+                    || !IsFinite(property.SCORE_MIN)
+                    || (property.USE_FIND_ANGLE && !IsRepresentablePoseGrid(property.FIND_ANGLE_MIN, property.FIND_ANGLE_MAX, property.FIND_ANGLE))
+                    || (property.USE_FIND_ANGLE && property.USE_COARSE_TO_FINE_ANGLE_SEARCH
+                        && !IsRepresentablePoseGrid(property.FIND_ANGLE_MIN, property.FIND_ANGLE_MAX, property.COARSE_ANGLE_STEP))
+                    || (property.USE_FIND_SCALE && !IsRepresentablePoseGrid(property.FIND_SCALE_MIN, property.FIND_SCALE_MAX, property.FIND_SCALE_STEP))
+                    || (property.USE_HYBRID_VERIFY && !IsFinite(property.HYBRID_VERIFY_IMAGE_WEIGHT))))
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = "Pose uniqueness validation requires one result, one search region, a finite score margin in 0..1, angle difference in (0,180], positive relative scale difference, finite score settings and active grids representable at six-decimal model precision with Int32 indices.";
+                return false;
+            }
+
+            if (UsePoseRefinement
+                && (PoseRefinementMaximumIterations < 1 || PoseRefinementMaximumIterations > 100
+                    || !IsFinite(PoseRefinementEpsilon) || PoseRefinementEpsilon <= 0D
+                    || (property.USE_FIND_ANGLE && !IsRepresentablePoseGrid(property.FIND_ANGLE_MIN, property.FIND_ANGLE_MAX, property.FIND_ANGLE))
+                    || (property.USE_FIND_ANGLE && property.USE_COARSE_TO_FINE_ANGLE_SEARCH
+                        && !IsRepresentablePoseGrid(property.FIND_ANGLE_MIN, property.FIND_ANGLE_MAX, property.COARSE_ANGLE_STEP))
+                    || (property.USE_FIND_SCALE && !IsRepresentablePoseGrid(property.FIND_SCALE_MIN, property.FIND_SCALE_MAX, property.FIND_SCALE_STEP))))
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = "Pose refinement requires 1..100 iterations, positive finite epsilon and representable active pose grids.";
+                return false;
+            }
+
+            if (property.SEARCH_STEP <= 0)
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching SEARCH_STEP must be greater than 0. SEARCH_STEP={property.SEARCH_STEP}.";
+                return false;
+            }
+
+            if (property.MAX_TEMPLATE_POINTS <= 0)
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching MAX_TEMPLATE_POINTS must be greater than 0. MAX_TEMPLATE_POINTS={property.MAX_TEMPLATE_POINTS}.";
+                return false;
+            }
+
+            if (property.USE_PYRAMID_POSITION_PROPOSAL && property.PYRAMID_POSITION_TOP_N <= 0)
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching pyramid proposal top N must be greater than 0. TopN={property.PYRAMID_POSITION_TOP_N}.";
+                return false;
+            }
+
+            if (property.USE_PYRAMID_POSITION_PROPOSAL
+                && (property.PYRAMID_POSITION_MIN_SCORE < -1D || property.PYRAMID_POSITION_MIN_SCORE > 1D))
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching pyramid proposal min score must be between -1 and 1. MinScore={property.PYRAMID_POSITION_MIN_SCORE}.";
+                return false;
+            }
+
+            if (property.USE_FIND_ANGLE && property.FIND_ANGLE <= 0)
+            {
+                errorCode = VisionToolErrorCode.MatchingInvalidAngleStep;
+                message = $"Edge based matching angle step must be greater than 0 when angle search is enabled. AngleStep={property.FIND_ANGLE}.";
+                return false;
+            }
+
+            if (property.USE_FIND_ANGLE
+                && property.USE_COARSE_TO_FINE_ANGLE_SEARCH
+                && property.COARSE_ANGLE_STEP <= 0)
+            {
+                errorCode = VisionToolErrorCode.MatchingInvalidAngleStep;
+                message = $"Edge based matching coarse angle step must be greater than 0 when coarse-to-fine angle search is enabled. CoarseAngleStep={property.COARSE_ANGLE_STEP}.";
+                return false;
+            }
+
+            if (property.USE_FIND_ANGLE
+                && property.USE_COARSE_TO_FINE_ANGLE_SEARCH
+                && property.COARSE_ANGLE_TOP_K <= 0)
+            {
+                errorCode = VisionToolErrorCode.MatchingInvalidAngleStep;
+                message = $"Edge based matching coarse angle top K must be greater than 0 when coarse-to-fine angle search is enabled. CoarseAngleTopK={property.COARSE_ANGLE_TOP_K}.";
+                return false;
+            }
+
+            if (property.USE_FIND_SCALE
+                && (property.FIND_SCALE_MIN <= 0D || property.FIND_SCALE_MAX <= 0D))
+            {
+                errorCode = VisionToolErrorCode.MatchingInvalidScale;
+                message = $"Edge based matching scale range must be greater than 0 when scale search is enabled. Scale={property.FIND_SCALE_MIN:0.###}..{property.FIND_SCALE_MAX:0.###}.";
+                return false;
+            }
+
+            if (property.USE_FIND_SCALE && property.FIND_SCALE_STEP <= 0D)
+            {
+                errorCode = VisionToolErrorCode.MatchingInvalidScale;
+                message = $"Edge based matching scale step must be greater than 0 when scale search is enabled. ScaleStep={property.FIND_SCALE_STEP:0.###}.";
+                return false;
+            }
+
+            if (property.USE_HYBRID_VERIFY && property.HYBRID_VERIFY_TOP_N <= 0)
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching hybrid verify top N must be greater than 0. HybridTopN={property.HYBRID_VERIFY_TOP_N}.";
+                return false;
+            }
+
+            if (property.USE_HYBRID_VERIFY
+                && (property.HYBRID_VERIFY_IMAGE_WEIGHT < 0D || property.HYBRID_VERIFY_IMAGE_WEIGHT > 1D))
+            {
+                errorCode = VisionToolErrorCode.InvalidParameter;
+                message = $"Edge based matching hybrid image weight must be between 0 and 1. HybridImageWeight={property.HYBRID_VERIFY_IMAGE_WEIGHT}.";
+                return false;
+            }
+
+            if (!TryValidateAdaptiveThreshold(
+                property,
+                VisionToolErrorCode.MatchingInvalidAdaptiveBlockSize,
+                out errorCode,
+                out message))
+            {
+                return false;
+            }
+
+            if (!TryValidateRoiSet(
+                property,
+                property.USE_ROI,
+                true,
+                VisionToolErrorCode.MatchingRoiInvalid,
+                "Edge based matching",
+                out errorCode,
+                out message))
+            {
+                return false;
+            }
+
+            computeEvidence = computeSession?.DescribeCpuExecution(CurrentCancellationToken);
+            errorCode = VisionToolErrorCode.None;
+            message = string.Empty;
+            return true;
+        }
+
+        protected override bool TryValidateAfterRun(out VisionToolErrorCode errorCode, out string message)
+        {
+            if (results == null || results.Count == 0)
+            {
+                errorCode = lastMatchingErrorCode;
+                message = lastMatchingMessage;
+                return false;
+            }
+
+            errorCode = VisionToolErrorCode.None;
+            message = string.Empty;
+            return true;
+        }
+
+        public override void Run()
+        {
+            CurrentCancellationToken.ThrowIfCancellationRequested();
+            swTaktTimems.Restart();
+            results.Clear();
+            ResetMatchingFailure();
+            ResetPhaseTimings();
+            ResetCandidateDiagnostics();
+
+            if (OpenCvHelper.IsImageEmpty(imageSource))
+            {
+                SetMatchingFailure(VisionToolErrorCode.InputImageInvalid, "Source image is not loaded.");
+                return;
+            }
+
+            long modelCacheStart = StartPhaseTiming();
+            TemplateModelCache modelCache = GetTemplateModelCache();
+            CurrentCancellationToken.ThrowIfCancellationRequested();
+            StopPhaseTiming("ModelCache", modelCacheStart);
+            EdgeTemplateModel model = modelCache?.Model;
+            if (model == null)
+            {
+                SetMatchingFailure(
+                    VisionToolErrorCode.MatchingTemplateInvalid,
+                    $"Edge based matching template model could not be created. {FormatMatchingOptions()}");
+                return;
+            }
+
+            if (model.Points.Count == 0)
+            {
+                SetMatchingFailure(
+                    VisionToolErrorCode.MatchingTemplateInvalid,
+                    $"Edge based matching template has no usable edge points. {FormatMatchingOptions()}");
+                return;
+            }
+
+            if (property.USE_MULTI_ROI)
+            {
+                RunMultiRoi(modelCache);
+            }
+            else
+            {
+                Rect roi = NormalizeRoi(property.CvROI);
+                RunRoi(modelCache, roi, property.USE_ROI);
+            }
+
+            CurrentCancellationToken.ThrowIfCancellationRequested();
+
+            if (property.USE_DRAW_IMAGE || results.Count > 0)
+            {
+                long drawStart = StartPhaseTiming();
+                DrawResultImage();
+                CurrentCancellationToken.ThrowIfCancellationRequested();
+                StopPhaseTiming("DrawResult", drawStart);
+            }
+
+            swTaktTimems.Stop();
+        }
+
+        private void RunMultiRoi(TemplateModelCache modelCache)
+        {
+            if (property.CvROIS == null)
+            {
+                return;
+            }
+
+            foreach (Rect roi in property.CvROIS)
+            {
+                CurrentCancellationToken.ThrowIfCancellationRequested();
+                RunRoi(modelCache, NormalizeRoi(roi), true);
+            }
+        }
+
+        private void RunRoi(TemplateModelCache modelCache, Rect roi, bool useRoi)
+        {
+            CurrentCancellationToken.ThrowIfCancellationRequested();
+            long preprocessStart = StartPhaseTiming();
+            Mat source = CreatePreprocessedImage(roi, useRoi, property);
+            StopPhaseTiming("Preprocess", preprocessStart);
+            using (source)
+            {
+                CurrentCancellationToken.ThrowIfCancellationRequested();
+                long gradientStart = StartPhaseTiming();
+                GradientImage gradients = GradientImage.Create(
+                    source,
+                    property.MIN_GRADIENT_MAGNITUDE,
+                    CurrentCancellationToken);
+                StopPhaseTiming("SourceGradient", gradientStart);
+                using (gradients)
+                {
+                    CurrentCancellationToken.ThrowIfCancellationRequested();
+                    EdgeTemplateModel model = modelCache.Model;
+                    Mat template = modelCache.PreparedTemplate;
+                    List<RotatedEdgeTemplateModel> searchModels = ShouldUseCoarseToFineAngleSearch()
+                        ? null
+                        : GetSearchModels(modelCache, property.FIND_ANGLE);
+                    List<RectangleF> suppressedBounds = new List<RectangleF>();
+                    int localMatchCount = property.USE_MULTI_ROI ? Math.Max(1, property.NUM_MATCH) : property.NUM_MATCH;
+
+                    if (TryRunScaleSeedMultiMatch(
+                        source,
+                        gradients,
+                        modelCache,
+                        template,
+                        searchModels,
+                        roi,
+                        useRoi,
+                        suppressedBounds,
+                        localMatchCount))
+                    {
+                        return;
+                    }
+
+                    for (int i = 0; i < localMatchCount; i++)
+                    {
+                        CurrentCancellationToken.ThrowIfCancellationRequested();
+                        long proposalStart = StartPhaseTiming();
+                        MatchCandidate imageProposal = CreateHybridImageProposalCandidate(
+                            gradients,
+                            source,
+                            template,
+                            modelCache,
+                            suppressedBounds);
+                        StopPhaseTiming("HybridImageProposal", proposalStart);
+                        RecordImageProposalDiagnostics(imageProposal);
+
+                        MatchCandidate candidate = imageProposal;
+                        List<MatchCandidate> candidateSeeds = new List<MatchCandidate>();
+                        bool useFastPath = !UsePoseRefinement && TryUseHybridProposalFastPath(imageProposal, localMatchCount);
+                        if (useFastPath)
+                        {
+                            candidateDiagnostics.FastPathCount++;
+                            candidateDiagnostics.ImageProposalSelectedCount++;
+                        }
+                        else
+                        {
+                            if (ShouldUseHybridVerify())
+                            {
+                                candidateDiagnostics.FallbackSearchCount++;
+                            }
+
+                            long searchStart = StartPhaseTiming();
+                            candidate = FindBestCandidate(
+                                source,
+                                gradients,
+                                modelCache,
+                                searchModels,
+                                suppressedBounds,
+                                out candidateSeeds);
+                            StopPhaseTiming("SearchEdgeCandidate", searchStart);
+                            RecordEdgeSearchDiagnostics(candidateSeeds, candidate);
+                            if (UsePoseRefinement)
+                            {
+                                long refineStart = StartPhaseTiming();
+                                candidate = candidateSearch.RefineCandidates(source, gradients, modelCache, candidateSeeds, candidate, imageProposal);
+                                StopPhaseTiming("PoseRefinement", refineStart);
+                            }
+                            long verifyStart = StartPhaseTiming();
+                            candidate = ApplyHybridVerification(source, template, candidate, candidateSeeds, imageProposal);
+                            StopPhaseTiming("HybridVerify", verifyStart);
+                            if (!ShouldUseHybridVerify())
+                            {
+                                RecordCandidateAmbiguityDiagnostics(candidateSeeds, candidate, template);
+                            }
+                        }
+
+                        RecordCandidateDisplayEvidence(
+                            candidate,
+                            (candidateSeeds ?? new List<MatchCandidate>())
+                                .Concat(imageProposal == null
+                                    ? Enumerable.Empty<MatchCandidate>()
+                                    : new[] { imageProposal }),
+                            template,
+                            roi,
+                            useRoi);
+
+                        if (candidate == null || candidate.Score < property.SCORE_MIN)
+                        {
+                            RecordUniqueMatchNoMatch(candidate);
+                            if (results.Count == 0)
+                            {
+                                SetMatchingFailure(
+                                    VisionToolErrorCode.MatchingNoResult,
+                                    $"Edge based matching found no result above score threshold. BestScore={(candidate?.Score * 100.0) ?? 0:0.###}, {FormatMatchingOptions()}");
+                            }
+
+                            break;
+                        }
+
+                        if (UsePoseUniquenessValidation)
+                        {
+                            long poseStart = StartPhaseTiming();
+                            double distanceThreshold = Math.Max(8D, Math.Min(template.Width, template.Height) * CandidateAmbiguityDistanceFactor);
+                            List<MatchCandidate> poseCandidates = candidateSearch.FindPoseAlternatives(gradients, modelCache, candidate, distanceThreshold);
+                            poseCandidates.Insert(0, candidate);
+                            if (UsePoseRefinement) candidateSearch.RefineCandidates(source, gradients, modelCache, poseCandidates, candidate, null);
+                            if (ShouldUseHybridVerify()) hybridSearch.VerifyCandidateScores(source, template, poseCandidates);
+                            matchDecision.EvaluatePoseMatch(poseCandidates, roi, useRoi, distanceThreshold);
+                            StopPhaseTiming("PoseUniqueness", poseStart);
+                        }
+
+                        if (!TryAcceptUniqueMatch(candidate) || !matchDecision.TryAcceptPoseMatch())
+                        {
+                            break;
+                        }
+
+                        candidate = ApplySubpixelRefinement(gradients, modelCache, candidate);
+                        ApplyGlobalPolarityState(gradients, modelCache, candidate);
+                        MatchingResult result = CreateResult(candidate, model, roi, useRoi);
+                        if (!IsDuplicate(result))
+                        {
+                            result.Index = results.Count + 1;
+                            results.Add(result);
+                        }
+
+                        suppressedBounds.Add(CreateExpandedBounds(candidate.Bounds, 0.35f));
+                    }
+                }
+            }
+        }
+
+        private bool TryRunScaleSeedMultiMatch(
+            Mat source,
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            Mat template,
+            List<RotatedEdgeTemplateModel> searchModels,
+            Rect roi,
+            bool useRoi,
+            List<RectangleF> suppressedBounds,
+            int localMatchCount)
+        {
+            if (UsePoseRefinement || !ShouldUseScaleSeedMultiMatch(localMatchCount)
+                || searchModels == null
+                || searchModels.Count == 0)
+            {
+                return false;
+            }
+
+            // Scale search scans every candidate position for every scale. For multi-match,
+            // keep the first full-search seed pool and only fall back to full search if that
+            // pool cannot provide enough non-overlapping matches.
+            int targetResultCount = results.Count + localMatchCount;
+            int seedCapacity = Math.Max(GetCandidateSeedCapacity(), localMatchCount);
+            List<MatchCandidate> seedPool = new List<MatchCandidate>(seedCapacity);
+
+            if (ShouldUseHybridVerify())
+            {
+                candidateDiagnostics.FallbackSearchCount++;
+            }
+
+            long searchStart = StartPhaseTiming();
+            MatchCandidate firstCandidate = FindBestCandidate(
+                source,
+                gradients,
+                modelCache,
+                searchModels,
+                suppressedBounds,
+                out List<MatchCandidate> candidateSeeds);
+            StopPhaseTiming("SearchEdgeCandidate", searchStart);
+            RecordEdgeSearchDiagnostics(candidateSeeds, firstCandidate);
+            MergeCandidateSeeds(seedPool, candidateSeeds, seedCapacity);
+            TrackCandidateSeed(seedPool, firstCandidate, seedCapacity);
+
+            while (results.Count < targetResultCount)
+            {
+                CurrentCancellationToken.ThrowIfCancellationRequested();
+                List<MatchCandidate> availableSeeds = CreateAvailableCandidateSeeds(seedPool, suppressedBounds);
+                MatchCandidate fallback = availableSeeds.Count > 0 ? availableSeeds[0] : null;
+                if (fallback == null)
+                {
+                    break;
+                }
+
+                long verifyStart = StartPhaseTiming();
+                MatchCandidate candidate = ApplyHybridVerification(source, template, fallback, availableSeeds, null);
+                StopPhaseTiming("HybridVerify", verifyStart);
+
+                if (!TryAcceptCandidate(candidate, gradients, modelCache, roi, useRoi, suppressedBounds))
+                {
+                    return true;
+                }
+            }
+
+            while (results.Count < targetResultCount)
+            {
+                CurrentCancellationToken.ThrowIfCancellationRequested();
+                if (ShouldUseHybridVerify())
+                {
+                    candidateDiagnostics.FallbackSearchCount++;
+                }
+
+                long fallbackSearchStart = StartPhaseTiming();
+                MatchCandidate candidate = FindBestCandidate(
+                    source,
+                    gradients,
+                    modelCache,
+                    searchModels,
+                    suppressedBounds,
+                    out candidateSeeds);
+                StopPhaseTiming("SearchEdgeCandidate", fallbackSearchStart);
+                RecordEdgeSearchDiagnostics(candidateSeeds, candidate);
+
+                long verifyStart = StartPhaseTiming();
+                candidate = ApplyHybridVerification(source, template, candidate, candidateSeeds, null);
+                StopPhaseTiming("HybridVerify", verifyStart);
+
+                if (!TryAcceptCandidate(candidate, gradients, modelCache, roi, useRoi, suppressedBounds))
+                {
+                    return true;
+                }
+            }
+
+            return true;
+        }
+
+        private bool ShouldUseScaleSeedMultiMatch(int localMatchCount)
+        {
+            return property.USE_FIND_SCALE
+                && !property.USE_FIND_ANGLE
+                && !property.USE_MULTI_ROI
+                && ShouldUseHybridVerify()
+                && localMatchCount > 1;
+        }
+
+        private bool TryAcceptCandidate(
+            MatchCandidate candidate,
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            Rect roi,
+            bool useRoi,
+            List<RectangleF> suppressedBounds)
+        {
+            if (candidate == null || candidate.Score < property.SCORE_MIN)
+            {
+                if (results.Count == 0)
+                {
+                    SetMatchingFailure(
+                        VisionToolErrorCode.MatchingNoResult,
+                        $"Edge based matching found no result above score threshold. BestScore={(candidate?.Score * 100.0) ?? 0:0.###}, {FormatMatchingOptions()}");
+                }
+
+                return false;
+            }
+
+            candidate = ApplySubpixelRefinement(gradients, modelCache, candidate);
+            ApplyGlobalPolarityState(gradients, modelCache, candidate);
+            MatchingResult result = CreateResult(candidate, modelCache.Model, roi, useRoi);
+            if (!IsDuplicate(result))
+            {
+                result.Index = results.Count + 1;
+                results.Add(result);
+            }
+
+            suppressedBounds.Add(CreateExpandedBounds(candidate.Bounds, 0.35f));
+            return true;
+        }
+
+        private static List<MatchCandidate> CreateAvailableCandidateSeeds(
+            IEnumerable<MatchCandidate> seedPool,
+            List<RectangleF> suppressedBounds)
+        {
+            List<MatchCandidate> available = new List<MatchCandidate>();
+            foreach (MatchCandidate candidate in seedPool ?? Enumerable.Empty<MatchCandidate>())
+            {
+                if (candidate == null || IsSuppressed(candidate.Bounds, suppressedBounds))
+                {
+                    continue;
+                }
+
+                if (available.Any(existing => IsSameCandidate(existing, candidate)))
+                {
+                    continue;
+                }
+
+                available.Add(candidate);
+            }
+
+            available.Sort((left, right) => right.Score.CompareTo(left.Score));
+            return available;
+        }
+
+        private void ResetPhaseTimings()
+        {
+            if (CollectPhaseTimings)
+            {
+                lock (phaseElapsedSync)
+                {
+                    phaseElapsedMs.Clear();
+                }
+            }
+        }
+
+        private void ResetCandidateDiagnostics()
+        {
+            candidateDiagnostics = new CandidateDiagnostics();
+        }
+
+        private long StartPhaseTiming()
+        {
+            return CollectPhaseTimings ? Stopwatch.GetTimestamp() : 0L;
+        }
+
+        private void StopPhaseTiming(string phaseName, long startTimestamp)
+        {
+            if (!CollectPhaseTimings || startTimestamp == 0L || string.IsNullOrWhiteSpace(phaseName))
+            {
+                return;
+            }
+
+            AddPhaseTiming(phaseName, Stopwatch.GetTimestamp() - startTimestamp);
+        }
+
+        private void AddPhaseTiming(string phaseName, long elapsedTicks)
+        {
+            if (!CollectPhaseTimings) return;
+            double elapsedMs = elapsedTicks * 1000D / Stopwatch.Frequency;
+            lock (phaseElapsedSync)
+            {
+                if (phaseElapsedMs.TryGetValue(phaseName, out double currentMs))
+                {
+                    phaseElapsedMs[phaseName] = currentMs + elapsedMs;
+                    return;
+                }
+
+                phaseElapsedMs[phaseName] = elapsedMs;
+            }
+        }
+
+        protected override IDictionary<string, double> CollectMetrics()
+        {
+            IDictionary<string, double> metrics = base.CollectMetrics();
+            AddModelQualityMetrics(metrics, modelStore.Current?.Model);
+            AddModelPyramidDiagnostics(metrics, modelStore.Current?.Model);
+            AddSearchSpaceDiagnostics(metrics, modelStore.Current?.Model);
+            AddCandidateDiagnostics(metrics, candidateDiagnostics, property?.USE_FIND_SCALE == true);
+            AddUniqueMatchDiagnostics(metrics);
+            AddPoseMatchDiagnostics(metrics);
+            AddGlobalPolarityDiagnostics(metrics);
+            lock (phaseElapsedSync)
+            {
+                foreach (KeyValuePair<string, double> phase in phaseElapsedMs)
+                {
+                    metrics[$"Phase.{phase.Key}.Ms"] = phase.Value;
+                }
+            }
+
+            return metrics;
+        }
+
+        private void AddGlobalPolarityDiagnostics(IDictionary<string, double> metrics)
+        {
+            if (metrics == null || property == null)
+            {
+                return;
+            }
+
+            metrics["GlobalPolarity.AllowReversal"] = property.ALLOW_GLOBAL_POLARITY_REVERSAL ? 1D : 0D;
+            metrics["GlobalPolarity.Reversed"] = results.Count == 1 && results[0].PolarityReversed ? 1D : 0D;
+            metrics["GlobalPolarity.SameCount"] = results.Count(result => !result.PolarityReversed);
+            metrics["GlobalPolarity.ReversedCount"] = results.Count(result => result.PolarityReversed);
+        }
+
+        private void AddUniqueMatchDiagnostics(IDictionary<string, double> metrics)
+        {
+            if (metrics == null || property == null)
+            {
+                return;
+            }
+
+            bool enabled = property.USE_UNIQUE_MATCH_VALIDATION;
+            metrics["UniqueMatch.Enabled"] = enabled ? 1D : 0D;
+            metrics["UniqueMatch.State"] = enabled ? (double)candidateDiagnostics.UniqueMatchState : 0D;
+            metrics["UniqueMatch.MinimumInternalTopK"] = enabled ? UniqueMatchMinimumInternalTopK : 0D;
+            metrics["UniqueMatch.PlausibleAlternativeCount"] = candidateDiagnostics.UniqueMatchPlausibleAlternativeCount;
+            metrics["UniqueMatch.SelectedScore"] = NormalizeDiagnosticScore(candidateDiagnostics.UniqueMatchSelectedScore);
+            metrics["UniqueMatch.StrongestAlternativeScore"] = NormalizeDiagnosticScore(candidateDiagnostics.UniqueMatchStrongestAlternativeScore);
+            metrics["UniqueMatch.ScoreMargin"] = NormalizeDiagnosticScore(candidateDiagnostics.UniqueMatchScoreMargin);
+            metrics["UniqueMatch.MinimumScoreMargin"] = enabled
+                ? property.UNIQUE_MATCH_MIN_SCORE_MARGIN
+                : 0D;
+            metrics["UniqueMatch.DistanceThresholdPx"] = NormalizeDiagnosticScore(candidateDiagnostics.UniqueMatchDistanceThreshold);
+        }
+
+        private static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
+
+        private static bool IsRepresentablePoseGrid(double minimum, double maximum, double step) =>
+            IsFinite(minimum) && IsFinite(maximum) && IsFinite(step) && Math.Round(step, 6) > 0D
+            && Math.Abs(minimum / step) < int.MaxValue && Math.Abs(maximum / step) < int.MaxValue;
+
+        private void AddPoseMatchDiagnostics(IDictionary<string, double> metrics)
+        {
+            metrics["PoseRefinement.Enabled"] = UsePoseRefinement ? 1D : 0D;
+            metrics["PoseRefinement.AttemptCount"] = candidateDiagnostics.PoseRefinementAttemptCount;
+            metrics["PoseRefinement.AcceptedCount"] = candidateDiagnostics.PoseRefinementAcceptedCount;
+            metrics["PoseRefinement.NativeFailureCount"] = candidateDiagnostics.PoseRefinementNativeFailureCount;
+            metrics["PoseMatch.Enabled"] = UsePoseUniquenessValidation ? 1D : 0D;
+            metrics["PoseMatch.State"] = (double)candidateDiagnostics.PoseMatchState;
+            metrics["PoseMatch.CheckedModelCount"] = candidateDiagnostics.PoseMatchCheckedModelCount;
+            metrics["PoseMatch.EligibleAlternativeCount"] = candidateDiagnostics.PoseMatchEligibleAlternativeCount;
+            metrics["PoseMatch.PlausibleAlternativeCount"] = candidateDiagnostics.PoseMatchPlausibleAlternativeCount;
+            metrics["PoseMatch.UnverifiedCandidateCount"] = candidateDiagnostics.PoseMatchUnverifiedCandidateCount;
+            metrics["PoseMatch.SelectedScore"] = NormalizeDiagnosticScore(candidateDiagnostics.PoseMatchSelectedScore);
+            metrics["PoseMatch.StrongestAlternativeScore"] = NormalizeDiagnosticScore(candidateDiagnostics.PoseMatchStrongestAlternativeScore);
+            metrics["PoseMatch.ScoreMargin"] = NormalizeDiagnosticScore(candidateDiagnostics.PoseMatchScoreMargin);
+            metrics["PoseMatch.AngleDifferenceDegrees"] = candidateDiagnostics.PoseMatchAngleDifference;
+            metrics["PoseMatch.RelativeScaleDifference"] = candidateDiagnostics.PoseMatchRelativeScaleDifference;
+            metrics["PoseMatch.DistanceThresholdPx"] = candidateDiagnostics.PoseMatchDistanceThreshold;
+            metrics["PoseMatch.MinimumScoreMargin"] = UsePoseUniquenessValidation ? NormalizeDiagnosticScore(PoseMatchMinScoreMargin) : 0D;
+            metrics["PoseMatch.MinimumAngleDifferenceDegrees"] = UsePoseUniquenessValidation ? NormalizeDiagnosticScore(PoseMatchMinAngleDifferenceDegrees) : 0D;
+            metrics["PoseMatch.MinimumRelativeScaleDifference"] = UsePoseUniquenessValidation ? NormalizeDiagnosticScore(PoseMatchMinRelativeScaleDifference) : 0D;
+        }
+
+        private static void AddCandidateDiagnostics(
+            IDictionary<string, double> metrics,
+            CandidateDiagnostics diagnostics,
+            bool scaleSearchEnabled)
+        {
+            if (metrics == null || diagnostics == null)
+            {
+                return;
+            }
+
+            metrics["Candidate.ScaleSearchEnabled"] = scaleSearchEnabled ? 1D : 0D;
+            metrics["Candidate.ImageProposalCount"] = diagnostics.ImageProposalCount;
+            metrics["Candidate.ImageProposalMissingCount"] = diagnostics.ImageProposalMissingCount;
+            metrics["Candidate.FastPathCount"] = diagnostics.FastPathCount;
+            metrics["Candidate.FallbackSearchCount"] = diagnostics.FallbackSearchCount;
+            metrics["Candidate.EdgeSeedCount"] = diagnostics.EdgeSeedCount;
+            metrics["Candidate.EdgeSearchBestCount"] = diagnostics.EdgeSearchBestCount;
+            metrics["Candidate.HybridCandidateCount"] = diagnostics.HybridCandidateCount;
+            metrics["Candidate.HybridVerifiedCount"] = diagnostics.HybridVerifiedCount;
+            metrics["Candidate.ImageProposalInVerificationCount"] = diagnostics.ImageProposalInVerificationCount;
+            metrics["Candidate.ImageProposalSelectedCount"] = diagnostics.ImageProposalSelectedCount;
+            metrics["Candidate.FallbackSelectedCount"] = diagnostics.FallbackSelectedCount;
+            metrics["Candidate.MaxImageProposalEdgeScore"] = NormalizeDiagnosticScore(diagnostics.MaxImageProposalEdgeScore);
+            metrics["Candidate.MaxImageProposalImageScore"] = NormalizeDiagnosticScore(diagnostics.MaxImageProposalImageScore);
+            metrics["Candidate.MaxEdgeSearchScore"] = NormalizeDiagnosticScore(diagnostics.MaxEdgeSearchScore);
+            metrics["Candidate.PyramidProposalScale"] = PyramidPositionProposalScale;
+            metrics["Candidate.PyramidProposalAttemptCount"] = diagnostics.PyramidProposalAttemptCount;
+            metrics["Candidate.PyramidProposalAcceptedCount"] = diagnostics.PyramidProposalAcceptedCount;
+            metrics["Candidate.PyramidProposalFallbackCount"] = diagnostics.PyramidProposalFallbackCount;
+            metrics["Candidate.PyramidProposalCandidateCount"] = diagnostics.PyramidProposalCandidateCount;
+            metrics["Candidate.PyramidProposalVerifiedCount"] = diagnostics.PyramidProposalVerifiedCount;
+            metrics["Candidate.MaxPyramidProposalScore"] = NormalizeDiagnosticScore(diagnostics.MaxPyramidProposalScore);
+            metrics["Candidate.MaxPyramidVerifiedScore"] = NormalizeDiagnosticScore(diagnostics.MaxPyramidVerifiedScore);
+            metrics["Candidate.AmbiguousSelectionCount"] = diagnostics.AmbiguousSelectionCount;
+            metrics["Candidate.AmbiguousAlternativeCount"] = diagnostics.AmbiguousAlternativeCount;
+            metrics["Candidate.SameScaleAmbiguousAlternativeCount"] = diagnostics.SameScaleAmbiguousAlternativeCount;
+            metrics["Candidate.DifferentScaleAmbiguousAlternativeCount"] = diagnostics.DifferentScaleAmbiguousAlternativeCount;
+            metrics["Candidate.MaxAmbiguousAlternativeScore"] = NormalizeDiagnosticScore(diagnostics.MaxAmbiguousAlternativeScore);
+            metrics["Candidate.MinAmbiguousScoreGap"] = NormalizeDiagnosticScore(diagnostics.MinAmbiguousScoreGap);
+            metrics["Candidate.MaxAmbiguousDistance"] = NormalizeDiagnosticScore(diagnostics.MaxAmbiguousDistance);
+            metrics["Candidate.MaxAmbiguousScaleDelta"] = NormalizeDiagnosticScore(diagnostics.MaxAmbiguousScaleDelta);
+            metrics["Candidate.ScaleAmbiguityRisk"] = scaleSearchEnabled
+                && diagnostics.AmbiguousSelectionCount > 0
+                ? 1D
+                : 0D;
+        }
+
+        private static double NormalizeDiagnosticScore(double value)
+        {
+            return double.IsNaN(value) || double.IsInfinity(value) ? 0D : value;
+        }
+
+        private void RecordImageProposalDiagnostics(MatchCandidate imageProposal)
+        {
+            if (!ShouldUseHybridVerify())
+            {
+                return;
+            }
+
+            if (imageProposal == null)
+            {
+                candidateDiagnostics.ImageProposalMissingCount++;
+                return;
+            }
+
+            candidateDiagnostics.ImageProposalCount++;
+            candidateDiagnostics.MaxImageProposalEdgeScore = Math.Max(
+                candidateDiagnostics.MaxImageProposalEdgeScore,
+                imageProposal.Score);
+            if (!double.IsNaN(imageProposal.ImageVerifyScore))
+            {
+                candidateDiagnostics.MaxImageProposalImageScore = Math.Max(
+                    candidateDiagnostics.MaxImageProposalImageScore,
+                    imageProposal.ImageVerifyScore);
+            }
+        }
+
+        private void RecordEdgeSearchDiagnostics(IEnumerable<MatchCandidate> candidateSeeds, MatchCandidate best)
+        {
+            if (!ShouldUseHybridVerify())
+            {
+                return;
+            }
+
+            candidateDiagnostics.EdgeSeedCount += candidateSeeds?.Count() ?? 0;
+            if (best == null)
+            {
+                return;
+            }
+
+            candidateDiagnostics.EdgeSearchBestCount++;
+            candidateDiagnostics.MaxEdgeSearchScore = Math.Max(candidateDiagnostics.MaxEdgeSearchScore, best.Score);
+        }
+
+        private void RecordCandidateAmbiguityDiagnostics(
+            IEnumerable<MatchCandidate> candidates,
+            MatchCandidate selected,
+            Mat template)
+        {
+            EvaluateUniqueMatch(candidates, selected, template);
+
+            if (candidates == null || selected == null || OpenCvHelper.IsImageEmpty(template))
+            {
+                return;
+            }
+
+            double distanceThreshold = Math.Max(8D, Math.Min(template.Width, template.Height) * CandidateAmbiguityDistanceFactor);
+            int ambiguousAlternativeCount = 0;
+            int sameScaleAmbiguousAlternativeCount = 0;
+            int differentScaleAmbiguousAlternativeCount = 0;
+            double maxAlternativeScore = double.NegativeInfinity;
+            double minScoreGap = double.PositiveInfinity;
+            double maxDistance = double.NegativeInfinity;
+            double maxScaleDelta = double.NegativeInfinity;
+
+            foreach (MatchCandidate candidate in candidates)
+            {
+                if (candidate == null || IsSameCandidate(candidate, selected))
+                {
+                    continue;
+                }
+
+                double dx = candidate.TemplateCenter.X - selected.TemplateCenter.X;
+                double dy = candidate.TemplateCenter.Y - selected.TemplateCenter.Y;
+                double distance = Math.Sqrt((dx * dx) + (dy * dy));
+                if (distance < distanceThreshold)
+                {
+                    continue;
+                }
+
+                double scoreGap = selected.Score - candidate.Score;
+                if (scoreGap > CandidateAmbiguityScoreGapThreshold)
+                {
+                    continue;
+                }
+
+                ambiguousAlternativeCount++;
+                double scaleDelta = Math.Abs(candidate.Scale - selected.Scale);
+                if (scaleDelta <= 0.0001D)
+                {
+                    sameScaleAmbiguousAlternativeCount++;
+                }
+                else
+                {
+                    differentScaleAmbiguousAlternativeCount++;
+                }
+
+                maxAlternativeScore = Math.Max(maxAlternativeScore, candidate.Score);
+                minScoreGap = Math.Min(minScoreGap, scoreGap);
+                maxDistance = Math.Max(maxDistance, distance);
+                maxScaleDelta = Math.Max(maxScaleDelta, scaleDelta);
+            }
+
+            if (ambiguousAlternativeCount <= 0)
+            {
+                return;
+            }
+
+            candidateDiagnostics.AmbiguousSelectionCount++;
+            candidateDiagnostics.AmbiguousAlternativeCount += ambiguousAlternativeCount;
+            candidateDiagnostics.SameScaleAmbiguousAlternativeCount += sameScaleAmbiguousAlternativeCount;
+            candidateDiagnostics.DifferentScaleAmbiguousAlternativeCount += differentScaleAmbiguousAlternativeCount;
+            candidateDiagnostics.MaxAmbiguousAlternativeScore = Math.Max(
+                candidateDiagnostics.MaxAmbiguousAlternativeScore,
+                maxAlternativeScore);
+            candidateDiagnostics.MinAmbiguousScoreGap = Math.Min(
+                candidateDiagnostics.MinAmbiguousScoreGap,
+                minScoreGap);
+            candidateDiagnostics.MaxAmbiguousDistance = Math.Max(
+                candidateDiagnostics.MaxAmbiguousDistance,
+                maxDistance);
+            candidateDiagnostics.MaxAmbiguousScaleDelta = Math.Max(
+                candidateDiagnostics.MaxAmbiguousScaleDelta,
+                maxScaleDelta);
+        }
+
+        private void RecordCandidateDisplayEvidence(
+            MatchCandidate selected,
+            IEnumerable<MatchCandidate> candidates,
+            Mat template,
+            Rect roi,
+            bool useRoi)
+        {
+            if (selected == null)
+            {
+                return;
+            }
+
+            if (candidateDiagnostics.SelectedCandidate == null)
+            {
+                candidateDiagnostics.SelectedCandidate = CreateCandidateDiagnostic(
+                    selected,
+                    roi,
+                    useRoi);
+            }
+
+            if (candidateDiagnostics.StrongestSpatialAlternative != null
+                || OpenCvHelper.IsImageEmpty(template))
+            {
+                return;
+            }
+
+            double distanceThreshold = Math.Max(
+                8D,
+                Math.Min(template.Width, template.Height) * CandidateAmbiguityDistanceFactor);
+            MatchCandidate strongest = null;
+            foreach (MatchCandidate candidate in candidates ?? Enumerable.Empty<MatchCandidate>())
+            {
+                if (candidate == null || IsSameCandidate(candidate, selected))
+                {
+                    continue;
+                }
+
+                double dx = candidate.TemplateCenter.X - selected.TemplateCenter.X;
+                double dy = candidate.TemplateCenter.Y - selected.TemplateCenter.Y;
+                if (Math.Sqrt((dx * dx) + (dy * dy)) < distanceThreshold)
+                {
+                    continue;
+                }
+
+                if (strongest == null
+                    || GetUniqueMatchSelectionScore(candidate) > GetUniqueMatchSelectionScore(strongest))
+                {
+                    strongest = candidate;
+                }
+            }
+
+            if (strongest != null)
+            {
+                candidateDiagnostics.StrongestSpatialAlternative = CreateCandidateDiagnostic(
+                    strongest,
+                    roi,
+                    useRoi);
+            }
+        }
+
+        private static EdgeBasedMatchingCandidateDiagnostic CreateCandidateDiagnostic(
+            MatchCandidate candidate,
+            Rect roi,
+            bool useRoi)
+        {
+            if (candidate == null)
+            {
+                return null;
+            }
+
+            float offsetX = useRoi ? roi.X : 0F;
+            float offsetY = useRoi ? roi.Y : 0F;
+            return new EdgeBasedMatchingCandidateDiagnostic
+            {
+                Score = candidate.Score,
+                Angle = candidate.Angle,
+                Scale = NormalizeScale(candidate.Scale),
+                Center = new PointF(
+                    (float)candidate.TemplateCenter.X + offsetX,
+                    (float)candidate.TemplateCenter.Y + offsetY),
+                Bounds = new RectangleF(
+                    candidate.Bounds.X + offsetX,
+                    candidate.Bounds.Y + offsetY,
+                    candidate.Bounds.Width,
+                    candidate.Bounds.Height)
+            };
+        }
+
+        private void EvaluateUniqueMatch(
+            IEnumerable<MatchCandidate> candidates,
+            MatchCandidate selected,
+            Mat template)
+        {
+            matchDecision.EvaluateUniqueMatch(candidates, selected, template);
+        }
+
+        private double GetUniqueMatchSelectionScore(MatchCandidate candidate)
+        {
+            return matchDecision.GetUniqueMatchSelectionScore(candidate);
+        }
+
+        private void RecordUniqueMatchNoMatch(MatchCandidate candidate)
+        {
+            matchDecision.RecordUniqueMatchNoMatch(candidate);
+        }
+
+        private bool TryAcceptUniqueMatch(MatchCandidate candidate)
+        {
+            return matchDecision.TryAcceptUniqueMatch(candidate);
+        }
+
+        private sealed class EdgeMatchDecision
+    {
+        private readonly EdgeBasedTemplateMatchingTool owner;
+
+        public EdgeMatchDecision(EdgeBasedTemplateMatchingTool owner)
+        {
+            this.owner = owner;
+        }
+
+        private IOpenCVPropertyEdgeBasedTemplateMatching property => owner.property;
+
+        private CandidateDiagnostics candidateDiagnostics => owner.candidateDiagnostics;
+
+        private CancellationToken cancellationToken => owner.CurrentCancellationToken;
+
+        private List<MatchingResult> results => owner.results;
+
+        private void SetMatchingFailure(VisionToolErrorCode errorCode, string message)
+            => owner.SetMatchingFailure(errorCode, message);
+
+        private string FormatMatchingOptions() => owner.FormatMatchingOptions();
+
+        private bool ShouldUseHybridVerify() => owner.ShouldUseHybridVerify();
+
+        public void EvaluateUniqueMatch(
+            IEnumerable<MatchCandidate> candidates,
+            MatchCandidate selected,
+            Mat template)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!property.USE_UNIQUE_MATCH_VALIDATION
+                || selected == null
+                || OpenCvHelper.IsImageEmpty(template))
+            {
+                return;
+            }
+
+            double distanceThreshold = Math.Max(
+                8D,
+                Math.Min(template.Width, template.Height) * CandidateAmbiguityDistanceFactor);
+            double selectedScore = GetUniqueMatchSelectionScore(selected);
+            double strongestAlternativeScore = double.NegativeInfinity;
+            int eligibleAlternativeCount = 0;
+            int plausibleAlternativeCount = 0;
+
+            foreach (MatchCandidate candidate in candidates ?? Enumerable.Empty<MatchCandidate>())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (candidate == null
+                    || IsSameCandidate(candidate, selected)
+                    || candidate.Score < property.SCORE_MIN)
+                {
+                    continue;
+                }
+
+                double dx = candidate.TemplateCenter.X - selected.TemplateCenter.X;
+                double dy = candidate.TemplateCenter.Y - selected.TemplateCenter.Y;
+                if (Math.Sqrt((dx * dx) + (dy * dy)) < distanceThreshold)
+                {
+                    continue;
+                }
+
+                eligibleAlternativeCount++;
+                double candidateSelectionScore = GetUniqueMatchSelectionScore(candidate);
+                strongestAlternativeScore = Math.Max(
+                    strongestAlternativeScore,
+                    candidateSelectionScore);
+                if (selectedScore - candidateSelectionScore < property.UNIQUE_MATCH_MIN_SCORE_MARGIN)
+                {
+                    plausibleAlternativeCount++;
+                }
+            }
+
+            double alternativeScore = eligibleAlternativeCount > 0
+                ? strongestAlternativeScore
+                : 0D;
+            double scoreMargin = selectedScore - alternativeScore;
+
+            candidateDiagnostics.UniqueMatchState = plausibleAlternativeCount > 0
+                ? UniqueMatchState.Ambiguous
+                : UniqueMatchState.Success;
+            candidateDiagnostics.UniqueMatchPlausibleAlternativeCount = plausibleAlternativeCount;
+            candidateDiagnostics.UniqueMatchSelectedScore = selectedScore;
+            candidateDiagnostics.UniqueMatchStrongestAlternativeScore = alternativeScore;
+            candidateDiagnostics.UniqueMatchScoreMargin = scoreMargin;
+            candidateDiagnostics.UniqueMatchDistanceThreshold = distanceThreshold;
+        }
+
+        public double GetUniqueMatchSelectionScore(MatchCandidate candidate)
+        {
+            return ShouldUseHybridVerify() && !double.IsNaN(candidate.HybridScore)
+                ? candidate.HybridScore
+                : candidate.Score;
+        }
+
+        public void RecordUniqueMatchNoMatch(MatchCandidate candidate)
+        {
+            if (owner.UsePoseUniquenessValidation) candidateDiagnostics.PoseMatchState = UniqueMatchState.NoMatch;
+            if (!property.USE_UNIQUE_MATCH_VALIDATION)
+            {
+                return;
+            }
+
+            candidateDiagnostics.UniqueMatchState = UniqueMatchState.NoMatch;
+            candidateDiagnostics.UniqueMatchSelectedScore = candidate?.Score ?? 0D;
+            candidateDiagnostics.UniqueMatchStrongestAlternativeScore = 0D;
+            candidateDiagnostics.UniqueMatchScoreMargin = 0D;
+        }
+
+        public void EvaluatePoseMatch(List<MatchCandidate> candidates, Rect roi, bool useRoi, double distanceThreshold)
+        {
+            MatchCandidate selected = candidates[0];
+            double selectedScore = ShouldUseHybridVerify() && !IsFinite(selected.HybridScore)
+                ? double.NaN : GetUniqueMatchSelectionScore(selected);
+            MatchCandidate strongest = null;
+            double strongestScore = double.NegativeInfinity;
+            int plausible = 0;
+            int unverified = ShouldUseHybridVerify() && !IsFinite(selected.HybridScore) ? 1 : 0;
+            foreach (MatchCandidate candidate in candidates.Skip(1))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (ShouldUseHybridVerify() && !IsFinite(candidate.HybridScore))
+                {
+                    unverified++;
+                    continue;
+                }
+
+                double score = GetUniqueMatchSelectionScore(candidate);
+                if (score > strongestScore)
+                {
+                    strongest = candidate;
+                    strongestScore = score;
+                }
+                if (selectedScore - score < owner.PoseMatchMinScoreMargin) plausible++;
+            }
+
+            candidateDiagnostics.PoseMatchState = plausible > 0 || unverified > 0 ? UniqueMatchState.Ambiguous : UniqueMatchState.Success;
+            candidateDiagnostics.PoseMatchEligibleAlternativeCount = candidates.Count - 1;
+            candidateDiagnostics.PoseMatchPlausibleAlternativeCount = plausible;
+            candidateDiagnostics.PoseMatchUnverifiedCandidateCount = unverified;
+            candidateDiagnostics.PoseMatchSelectedScore = selectedScore;
+            candidateDiagnostics.PoseMatchStrongestAlternativeScore = strongest == null ? 0D : strongestScore;
+            candidateDiagnostics.PoseMatchScoreMargin = selectedScore - candidateDiagnostics.PoseMatchStrongestAlternativeScore;
+            candidateDiagnostics.PoseMatchDistanceThreshold = distanceThreshold;
+            candidateDiagnostics.StrongestPoseAlternative = CreateCandidateDiagnostic(strongest, roi, useRoi);
+            candidateDiagnostics.PoseMatchAngleDifference = strongest == null ? 0D : GetPoseAngleDifference(selected.Angle, strongest.Angle);
+            candidateDiagnostics.PoseMatchRelativeScaleDifference = strongest == null ? 0D : GetPoseRelativeScaleDifference(selected.Scale, strongest.Scale);
+        }
+
+        public bool TryAcceptPoseMatch()
+        {
+            if (!owner.UsePoseUniquenessValidation || candidateDiagnostics.PoseMatchState != UniqueMatchState.Ambiguous) return true;
+            string reason = candidateDiagnostics.PoseMatchUnverifiedCandidateCount > 0
+                ? "Pose uniqueness could not verify all eligible candidates." : "Edge based matching rejected an ambiguous pose.";
+            SetMatchingFailure(VisionToolErrorCode.MatchingAmbiguous,
+                reason + $" BestScore={NormalizeDiagnosticScore(candidateDiagnostics.PoseMatchSelectedScore):0.######}, "
+                + $"AlternativeScore={candidateDiagnostics.PoseMatchStrongestAlternativeScore:0.######}, ScoreMargin={candidateDiagnostics.PoseMatchScoreMargin:0.######}, "
+                + $"RequiredMargin={owner.PoseMatchMinScoreMargin:0.######}, AngleDifference={candidateDiagnostics.PoseMatchAngleDifference:0.######}, "
+                + $"RelativeScaleDifference={candidateDiagnostics.PoseMatchRelativeScaleDifference:0.######}, PlausibleAlternatives={candidateDiagnostics.PoseMatchPlausibleAlternativeCount}, "
+                + $"UnverifiedCandidates={candidateDiagnostics.PoseMatchUnverifiedCandidateCount}. " + FormatMatchingOptions());
+            return false;
+        }
+
+        public bool TryAcceptUniqueMatch(MatchCandidate candidate)
+        {
+            if (!property.USE_UNIQUE_MATCH_VALIDATION)
+            {
+                return true;
+            }
+
+            if (candidateDiagnostics.UniqueMatchState == UniqueMatchState.Ambiguous)
+            {
+                SetMatchingFailure(
+                    VisionToolErrorCode.MatchingAmbiguous,
+                    $"Edge based matching rejected an ambiguous unique match. "
+                    + $"BestScore={candidateDiagnostics.UniqueMatchSelectedScore * 100D:0.###}, "
+                    + $"AlternativeScore={candidateDiagnostics.UniqueMatchStrongestAlternativeScore * 100D:0.###}, "
+                    + $"ScoreMargin={candidateDiagnostics.UniqueMatchScoreMargin * 100D:0.###}, "
+                    + $"RequiredMargin={property.UNIQUE_MATCH_MIN_SCORE_MARGIN * 100D:0.###}, "
+                    + $"PlausibleAlternatives={candidateDiagnostics.UniqueMatchPlausibleAlternativeCount}, "
+                    + FormatMatchingOptions());
+                return false;
+            }
+
+            if (candidateDiagnostics.UniqueMatchState == UniqueMatchState.Disabled)
+            {
+                candidateDiagnostics.UniqueMatchState = UniqueMatchState.Success;
+                candidateDiagnostics.UniqueMatchSelectedScore = GetUniqueMatchSelectionScore(candidate);
+                candidateDiagnostics.UniqueMatchStrongestAlternativeScore = 0D;
+                candidateDiagnostics.UniqueMatchScoreMargin = candidateDiagnostics.UniqueMatchSelectedScore;
+            }
+
+            return true;
+        }
+
+    }
+
+        private static void AddModelQualityMetrics(IDictionary<string, double> metrics, EdgeTemplateModel model)
+        {
+            if (metrics == null || model == null)
+            {
+                return;
+            }
+
+            int width = Math.Max(0, model.Width);
+            int height = Math.Max(0, model.Height);
+            List<TemplateEdgePoint> points = model.Points ?? new List<TemplateEdgePoint>();
+            int sampledPointCount = points.Count;
+            int rawPointCount = Math.Max(model.RawPointCount, sampledPointCount);
+            double templateArea = width > 0 && height > 0
+                ? (double)width * height
+                : 0D;
+
+            metrics["Model.TemplateWidth"] = width;
+            metrics["Model.TemplateHeight"] = height;
+            metrics["Model.RawEdgePointCount"] = rawPointCount;
+            metrics["Model.EdgePointCount"] = sampledPointCount;
+            metrics["Model.EdgeDensity"] = templateArea > 0D
+                ? sampledPointCount / templateArea
+                : 0D;
+            metrics["Model.PointSampleRatio"] = rawPointCount > 0
+                ? (double)sampledPointCount / rawPointCount
+                : 0D;
+            metrics["Model.PointLimitHit"] = rawPointCount > sampledPointCount ? 1D : 0D;
+
+            double coverageX = 0D;
+            double coverageY = 0D;
+            double quadrantBalance = 0D;
+            if (sampledPointCount > 0 && width > 0 && height > 0)
+            {
+                int minX = points.Min(point => point.X);
+                int maxX = points.Max(point => point.X);
+                int minY = points.Min(point => point.Y);
+                int maxY = points.Max(point => point.Y);
+                coverageX = (maxX - minX + 1D) / width;
+                coverageY = (maxY - minY + 1D) / height;
+
+                int[] quadrantCounts = new int[4];
+                foreach (TemplateEdgePoint point in points)
+                {
+                    bool right = point.X >= model.Center.X;
+                    bool bottom = point.Y >= model.Center.Y;
+                    int index = (right ? 1 : 0) + (bottom ? 2 : 0);
+                    quadrantCounts[index]++;
+                }
+
+                int maxQuadrant = quadrantCounts.Max();
+                int minQuadrant = quadrantCounts.Min();
+                quadrantBalance = maxQuadrant > 0
+                    ? (double)minQuadrant / maxQuadrant
+                    : 0D;
+            }
+
+            double coverageArea = coverageX * coverageY;
+            double smallTemplateRisk = Math.Min(width, height) < ModelSmallTemplateMinDimension ? 1D : 0D;
+            double lowEdgePointRisk = sampledPointCount < ModelLowEdgePointThreshold ? 1D : 0D;
+            double lowCoverageRisk = coverageArea < ModelLowCoverageAreaThreshold ? 1D : 0D;
+            double scaleCoverageWarningRisk = coverageArea < ModelScaleSearchCoverageWarningThreshold ? 1D : 0D;
+            double lowQuadrantBalanceRisk = quadrantBalance < ModelLowQuadrantBalanceThreshold ? 1D : 0D;
+            metrics["Model.EdgeCoverageX"] = coverageX;
+            metrics["Model.EdgeCoverageY"] = coverageY;
+            metrics["Model.EdgeCoverageArea"] = coverageArea;
+            metrics["Model.QuadrantBalance"] = quadrantBalance;
+            metrics["Model.SmallTemplateRisk"] = smallTemplateRisk;
+            metrics["Model.LowEdgePointRisk"] = lowEdgePointRisk;
+            metrics["Model.LowCoverageRisk"] = lowCoverageRisk;
+            metrics["Model.LowQuadrantBalanceRisk"] = lowQuadrantBalanceRisk;
+            metrics["Model.ScaleCoverageWarningRisk"] = scaleCoverageWarningRisk;
+            metrics["Model.ScaleSearchRisk"] = Math.Max(
+                Math.Max(smallTemplateRisk, lowEdgePointRisk),
+                Math.Max(scaleCoverageWarningRisk, lowQuadrantBalanceRisk));
+        }
+
+        private static void AddModelPyramidDiagnostics(IDictionary<string, double> metrics, EdgeTemplateModel model)
+        {
+            if (metrics == null || model == null)
+            {
+                return;
+            }
+
+            List<TemplateEdgePoint> points = model.Points ?? new List<TemplateEdgePoint>();
+            int highestUsableLevel = 0;
+            int emittedLevelCount = 0;
+            for (int level = 0; level < ModelPyramidMaxDiagnosticLevels; level++)
+            {
+                int divisor = 1 << level;
+                int width = Math.Max(1, (int)Math.Ceiling(model.Width / (double)divisor));
+                int height = Math.Max(1, (int)Math.Ceiling(model.Height / (double)divisor));
+                if (width < 1 || height < 1)
+                {
+                    break;
+                }
+
+                PyramidLevelDiagnostics levelDiagnostics = CreatePyramidLevelDiagnostics(points, width, height, divisor);
+                bool usable = width >= ModelPyramidMinUsableDimension
+                    && height >= ModelPyramidMinUsableDimension
+                    && levelDiagnostics.EdgePointCount >= ModelLowEdgePointThreshold
+                    && levelDiagnostics.CoverageArea >= ModelLowCoverageAreaThreshold;
+                if (usable)
+                {
+                    highestUsableLevel = level;
+                }
+
+                string prefix = string.Format(CultureInfo.InvariantCulture, "Model.Pyramid.Level{0}", level);
+                metrics[$"{prefix}.Width"] = width;
+                metrics[$"{prefix}.Height"] = height;
+                metrics[$"{prefix}.EdgePointCount"] = levelDiagnostics.EdgePointCount;
+                metrics[$"{prefix}.EdgeDensity"] = width > 0 && height > 0
+                    ? levelDiagnostics.EdgePointCount / ((double)width * height)
+                    : 0D;
+                metrics[$"{prefix}.CoverageArea"] = levelDiagnostics.CoverageArea;
+                metrics[$"{prefix}.QuadrantBalance"] = levelDiagnostics.QuadrantBalance;
+                metrics[$"{prefix}.Usable"] = usable ? 1D : 0D;
+                emittedLevelCount++;
+
+                if (width <= 1 && height <= 1)
+                {
+                    break;
+                }
+            }
+
+            // Diagnostic only: do not let pyramid estimates change search behavior without a survival audit.
+            metrics["Model.Pyramid.LevelCountEstimate"] = emittedLevelCount;
+            metrics["Model.Pyramid.HighestUsableLevel"] = highestUsableLevel;
+        }
+
+        private static PyramidLevelDiagnostics CreatePyramidLevelDiagnostics(
+            IEnumerable<TemplateEdgePoint> points,
+            int width,
+            int height,
+            int divisor)
+        {
+            HashSet<long> scaledPoints = new HashSet<long>();
+            foreach (TemplateEdgePoint point in points ?? Enumerable.Empty<TemplateEdgePoint>())
+            {
+                int x = Clamp((int)Math.Floor(point.X / (double)divisor), 0, width - 1);
+                int y = Clamp((int)Math.Floor(point.Y / (double)divisor), 0, height - 1);
+                scaledPoints.Add(((long)y << 32) | (uint)x);
+            }
+
+            if (scaledPoints.Count == 0 || width <= 0 || height <= 0)
+            {
+                return new PyramidLevelDiagnostics(0, 0D, 0D);
+            }
+
+            int minX = width;
+            int maxX = 0;
+            int minY = height;
+            int maxY = 0;
+            int[] quadrantCounts = new int[4];
+            double centerX = (width - 1D) / 2D;
+            double centerY = (height - 1D) / 2D;
+            foreach (long key in scaledPoints)
+            {
+                int x = (int)(key & 0xFFFFFFFF);
+                int y = (int)(key >> 32);
+                minX = Math.Min(minX, x);
+                maxX = Math.Max(maxX, x);
+                minY = Math.Min(minY, y);
+                maxY = Math.Max(maxY, y);
+
+                bool right = x >= centerX;
+                bool bottom = y >= centerY;
+                int index = (right ? 1 : 0) + (bottom ? 2 : 0);
+                quadrantCounts[index]++;
+            }
+
+            double coverageX = (maxX - minX + 1D) / width;
+            double coverageY = (maxY - minY + 1D) / height;
+            int maxQuadrant = quadrantCounts.Max();
+            int minQuadrant = quadrantCounts.Min();
+            double quadrantBalance = maxQuadrant > 0
+                ? (double)minQuadrant / maxQuadrant
+                : 0D;
+            return new PyramidLevelDiagnostics(scaledPoints.Count, coverageX * coverageY, quadrantBalance);
+        }
+
+        private void AddSearchSpaceDiagnostics(IDictionary<string, double> metrics, EdgeTemplateModel model)
+        {
+            if (metrics == null || model == null)
+            {
+                return;
+            }
+
+            Rect roi = NormalizeRoi(property?.USE_ROI == true ? property.CvROI : new Rect());
+            int searchWidth = Math.Max(0, roi.Width);
+            int searchHeight = Math.Max(0, roi.Height);
+            int positionsX = Math.Max(0, searchWidth - model.Width + 1);
+            int positionsY = Math.Max(0, searchHeight - model.Height + 1);
+            double positionsPerAngle = (double)positionsX * positionsY;
+            int angleCount = CreateSearchAngles().Count();
+            int coarseAngleCount = ShouldUseCoarseToFineAngleSearch()
+                ? CreateSearchAngles(property.COARSE_ANGLE_STEP).Count()
+                : angleCount;
+            int scaleCount = CreateSearchScales().Count();
+
+            metrics["Candidate.SearchAreaWidth"] = searchWidth;
+            metrics["Candidate.SearchAreaHeight"] = searchHeight;
+            metrics["Candidate.SearchAngleCount"] = angleCount;
+            metrics["Candidate.CoarseAngleCount"] = coarseAngleCount;
+            metrics["Candidate.SearchScaleCount"] = scaleCount;
+            metrics["Candidate.EstimatedPositionsPerAngle"] = positionsPerAngle;
+            metrics["Candidate.EstimatedRawSearchPositions"] = positionsPerAngle * angleCount * scaleCount;
+            metrics["Candidate.EstimatedCoarseSearchPositions"] = positionsPerAngle * coarseAngleCount * scaleCount;
+        }
+
+        private MatchCandidate FindBestCandidate(
+            Mat source,
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            List<RotatedEdgeTemplateModel> searchModels,
+            List<RectangleF> suppressedBounds,
+            out List<MatchCandidate> candidateSeeds)
+        {
+            return candidateSearch.FindBestCandidate(
+                source,
+                gradients,
+                modelCache,
+                searchModels,
+                suppressedBounds,
+                out candidateSeeds);
+        }
+
+        private MatchCandidate ApplySubpixelRefinement(
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            MatchCandidate candidate)
+        {
+            return candidateSearch.ApplySubpixelRefinement(gradients, modelCache, candidate);
+        }
+
+        private void ApplyGlobalPolarityState(
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            MatchCandidate candidate)
+        {
+            candidateSearch.ApplyGlobalPolarityState(gradients, modelCache, candidate);
+        }
+
+        private List<RotatedEdgeTemplateModel> GetSearchModels(TemplateModelCache modelCache, double angleStep)
+        {
+            return candidateSearch.GetSearchModels(modelCache, angleStep);
+        }
+
+        private IEnumerable<double> CreateSearchAngles()
+        {
+            return candidateSearch.CreateSearchAngles();
+        }
+
+        private IEnumerable<double> CreateSearchAngles(double angleStep)
+        {
+            return candidateSearch.CreateSearchAngles(angleStep);
+        }
+
+        private IEnumerable<double> CreateSearchAnglesAround(double centerAngle, double radius, double angleStep)
+        {
+            return candidateSearch.CreateSearchAnglesAround(centerAngle, radius, angleStep);
+        }
+
+        private IEnumerable<double> CreateSearchScales()
+        {
+            return candidateSearch.CreateSearchScales();
+        }
+
+        private bool ShouldUseCoarseToFineAngleSearch()
+        {
+            return candidateSearch.ShouldUseCoarseToFineAngleSearch();
+        }
+
+        private static bool ShouldTrackCandidateSeed(List<MatchCandidate> seeds, double score, int capacity, double centerX, double centerY)
+        {
+            return EdgeCandidateSearch.ShouldTrackCandidateSeed(seeds, score, capacity, centerX, centerY);
+        }
+
+        private static bool IsBetterCandidate(MatchCandidate candidate, MatchCandidate currentBest)
+        {
+            return EdgeCandidateSearch.IsBetterCandidate(candidate, currentBest);
+        }
+
+        private static bool IsBetterScore(double score, double centerX, double centerY, MatchCandidate currentBest)
+        {
+            return EdgeCandidateSearch.IsBetterScore(score, centerX, centerY, currentBest);
+        }
+
+        private static void TrackCandidateSeed(List<MatchCandidate> seeds, MatchCandidate candidate, int capacity)
+        {
+            EdgeCandidateSearch.TrackCandidateSeed(seeds, candidate, capacity);
+        }
+
+        private static void MergeCandidateSeeds(List<MatchCandidate> target, IEnumerable<MatchCandidate> source, int capacity)
+        {
+            EdgeCandidateSearch.MergeCandidateSeeds(target, source, capacity);
+        }
+
+        private static bool IsSameCandidate(MatchCandidate left, MatchCandidate right)
+        {
+            return EdgeCandidateSearch.IsSameCandidate(left, right);
+        }
+
+        private static MatchCandidate CreateMatchCandidate(
+            RotatedEdgeTemplateModel model,
+            int centerX,
+            int centerY,
+            RectangleF bounds,
+            double score)
+        {
+            return EdgeCandidateSearch.CreateMatchCandidate(model, centerX, centerY, bounds, score);
+        }
+
+        private double ScoreCandidate(GradientImage gradients, RotatedEdgeTemplateModel model, int centerX, int centerY)
+        {
+            return candidateSearch.ScoreCandidate(gradients, model, centerX, centerY);
+        }
+
+        private static RotatedEdgeTemplateModel CreateRotatedModel(EdgeTemplateModel model, double angle)
+        {
+            return EdgeCandidateSearch.CreateRotatedModel(model, angle);
+        }
+
+        private sealed class EdgeCandidateSearch
+    {
+        private readonly EdgeBasedTemplateMatchingTool owner;
+
+        public EdgeCandidateSearch(EdgeBasedTemplateMatchingTool owner)
+        {
+            this.owner = owner;
+        }
+
+        private IOpenCVPropertyEdgeBasedTemplateMatching property => owner.property;
+
+        private CandidateDiagnostics candidateDiagnostics => owner.candidateDiagnostics;
+
+        private EdgeTemplateModelStore modelStore => owner.modelStore;
+
+        private CancellationToken cancellationToken => owner.CurrentCancellationToken;
+
+        private long StartPhaseTiming() => owner.StartPhaseTiming();
+
+        private void StopPhaseTiming(string phaseName, long startTimestamp) => owner.StopPhaseTiming(phaseName, startTimestamp);
+
+        private int GetCandidateSeedCapacity() => owner.GetCandidateSeedCapacity();
+
+        private bool ShouldUseHybridSpatialSeeds() => owner.ShouldUseHybridSpatialSeeds();
+
+        public MatchCandidate FindBestCandidate(
+            Mat source,
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            List<RotatedEdgeTemplateModel> searchModels,
+            List<RectangleF> suppressedBounds,
+            out List<MatchCandidate> candidateSeeds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (TryFindBestCandidateFromPyramidPositionProposal(
+                source,
+                gradients,
+                modelCache,
+                suppressedBounds,
+                out MatchCandidate proposalCandidate,
+                out candidateSeeds))
+            {
+                return proposalCandidate;
+            }
+
+            if (ShouldUseCoarseToFineAngleSearch())
+            {
+                return FindBestCandidateCoarseToFine(gradients, modelCache, suppressedBounds, out candidateSeeds);
+            }
+
+            return FindBestCandidateFromModels(gradients, searchModels, suppressedBounds, out candidateSeeds);
+        }
+
+        private bool TryFindBestCandidateFromPyramidPositionProposal(
+            Mat source,
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            List<RectangleF> suppressedBounds,
+            out MatchCandidate candidate,
+            out List<MatchCandidate> candidateSeeds)
+        {
+            candidate = null;
+            candidateSeeds = null;
+            if (!ShouldUsePyramidPositionProposal(source, modelCache?.Model))
+            {
+                return false;
+            }
+
+            candidateDiagnostics.PyramidProposalAttemptCount++;
+            long proposalStart = StartPhaseTiming();
+            List<MatchCandidate> proposals = CreateHalfScalePositionProposals(source, modelCache);
+            StopPhaseTiming("PyramidProposal.Search", proposalStart);
+            candidateDiagnostics.PyramidProposalCandidateCount += proposals.Count;
+            if (proposals.Count == 0)
+            {
+                candidateDiagnostics.PyramidProposalFallbackCount++;
+                return false;
+            }
+
+            int seedCapacity = Math.Max(GetCandidateSeedCapacity(), Math.Max(1, property.PYRAMID_POSITION_TOP_N));
+            candidateSeeds = new List<MatchCandidate>(seedCapacity);
+            MatchCandidate best = null;
+            long verifyStart = StartPhaseTiming();
+            foreach (MatchCandidate proposal in proposals)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                candidateDiagnostics.MaxPyramidProposalScore = Math.Max(
+                    candidateDiagnostics.MaxPyramidProposalScore,
+                    proposal.Score);
+
+                double proposedTemplateCenterX = proposal.TemplateCenter.X / PyramidPositionProposalScale;
+                double proposedTemplateCenterY = proposal.TemplateCenter.Y / PyramidPositionProposalScale;
+                foreach (double angle in CreatePyramidProposalRefineAngles(proposal.Angle))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    RotatedEdgeTemplateModel model = modelCache.GetRotatedModel(angle);
+                    // The proposal is produced by a separately scaled template model.
+                    // Convert through the visual template center, then re-derive the full-resolution
+                    // model origin for each refine angle so rotated offset differences do not shift
+                    // the verification window away from the true candidate.
+                    int centerX = (int)Math.Round(proposedTemplateCenterX - model.TemplateCenterOffsetX);
+                    int centerY = (int)Math.Round(proposedTemplateCenterY - model.TemplateCenterOffsetY);
+                    MatchCandidate verified = FindBestCandidateNear(
+                        gradients,
+                        model,
+                        suppressedBounds,
+                        centerX,
+                        centerY,
+                        Math.Max(PyramidPositionProposalRefineRadius, Math.Max(1, property.SEARCH_STEP) * 2));
+                    if (verified == null)
+                    {
+                        continue;
+                    }
+
+                    candidateDiagnostics.PyramidProposalVerifiedCount++;
+                    candidateDiagnostics.MaxPyramidVerifiedScore = Math.Max(
+                        candidateDiagnostics.MaxPyramidVerifiedScore,
+                        verified.Score);
+                    TrackCandidateSeed(candidateSeeds, verified, seedCapacity);
+                    if (IsBetterCandidate(verified, best))
+                    {
+                        best = verified;
+                    }
+                }
+            }
+
+            StopPhaseTiming("PyramidProposal.Verify", verifyStart);
+            if (best == null)
+            {
+                candidateDiagnostics.PyramidProposalFallbackCount++;
+                return false;
+            }
+
+            double acceptScore = Math.Max(property.SCORE_MIN, property.PYRAMID_POSITION_MIN_SCORE);
+            double weakVerifiedScore = acceptScore + PyramidPositionProposalWeakVerifiedMargin;
+            // Proposal verification is a speed path, not the final fallback.
+            // If the full-resolution verified score only barely clears the operator threshold,
+            // use the existing full search so weak/downscaled proposals do not lock in a bad candidate.
+            if (best.Score < weakVerifiedScore)
+            {
+                candidateDiagnostics.PyramidProposalFallbackCount++;
+                return false;
+            }
+
+            candidateDiagnostics.PyramidProposalAcceptedCount++;
+            candidate = best;
+            TrackCandidateSeed(candidateSeeds, candidate, seedCapacity);
+            return true;
+        }
+
+        private bool ShouldUsePyramidPositionProposal(Mat source, EdgeTemplateModel model)
+        {
+            if (property?.USE_PYRAMID_POSITION_PROPOSAL != true
+                || property.USE_FIND_SCALE
+                || OpenCvHelper.IsImageEmpty(source)
+                || model == null
+                || property.PYRAMID_POSITION_TOP_N <= 0)
+            {
+                return false;
+            }
+
+            int scaledTemplateWidth = (int)Math.Round(model.Width * PyramidPositionProposalScale);
+            int scaledTemplateHeight = (int)Math.Round(model.Height * PyramidPositionProposalScale);
+            return scaledTemplateWidth >= PyramidPositionProposalMinTemplateSize
+                && scaledTemplateHeight >= PyramidPositionProposalMinTemplateSize
+                && source.Width > model.Width
+                && source.Height > model.Height;
+        }
+
+        private List<MatchCandidate> CreateHalfScalePositionProposals(Mat source, TemplateModelCache modelCache)
+        {
+            using (Mat scaledSource = ResizeForPyramidProposal(source, PyramidPositionProposalScale))
+            using (Mat scaledTemplate = ResizeForPyramidProposal(modelCache.PreparedTemplate, PyramidPositionProposalScale))
+            using (GradientImage scaledGradients = GradientImage.Create(
+                scaledSource,
+                property.MIN_GRADIENT_MAGNITUDE,
+                cancellationToken))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                EdgeTemplateModel scaledModel = modelStore.CreateModel(scaledTemplate);
+                if (scaledModel.Points.Count < ModelLowEdgePointThreshold)
+                {
+                    return new List<MatchCandidate>();
+                }
+
+                RotatedEdgeTemplateModel[] proposalModels = CreatePyramidProposalAngles()
+                    .Select(angle => CreateRotatedModel(scaledModel, angle))
+                    .ToArray();
+                int proposalStep = Math.Max(
+                    1,
+                    (int)Math.Round(Math.Max(1, property.SEARCH_STEP) * PyramidPositionProposalScale));
+                return FindTopCandidatesFromModels(
+                    scaledGradients,
+                    proposalModels,
+                    Math.Max(1, property.PYRAMID_POSITION_TOP_N),
+                    proposalStep);
+            }
+        }
+
+        private IEnumerable<double> CreatePyramidProposalAngles()
+        {
+            if (!property.USE_FIND_ANGLE)
+            {
+                yield return 0D;
+                yield break;
+            }
+
+            double step = ShouldUseCoarseToFineAngleSearch()
+                ? Math.Max(property.FIND_ANGLE, property.COARSE_ANGLE_STEP)
+                : Math.Max(property.FIND_ANGLE, property.COARSE_ANGLE_STEP);
+            foreach (double angle in CreateSearchAnglesInRange(property.FIND_ANGLE_MIN, property.FIND_ANGLE_MAX, step))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return angle;
+            }
+        }
+
+        private IEnumerable<double> CreatePyramidProposalRefineAngles(double proposalAngle)
+        {
+            if (!property.USE_FIND_ANGLE)
+            {
+                yield return 0D;
+                yield break;
+            }
+
+            double proposalStep = ShouldUseCoarseToFineAngleSearch()
+                ? Math.Max(property.FIND_ANGLE, property.COARSE_ANGLE_STEP)
+                : Math.Max(property.FIND_ANGLE, property.COARSE_ANGLE_STEP);
+            double radius = Math.Max(property.FIND_ANGLE, proposalStep / 2D);
+            foreach (double angle in CreateSearchAnglesAround(proposalAngle, radius, property.FIND_ANGLE))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return angle;
+            }
+        }
+
+        private List<MatchCandidate> FindTopCandidatesFromModels(
+            GradientImage gradients,
+            IEnumerable<RotatedEdgeTemplateModel> models,
+            int capacity,
+            int step)
+        {
+            List<MatchCandidate> candidates = new List<MatchCandidate>(capacity);
+            foreach (RotatedEdgeTemplateModel model in models ?? Enumerable.Empty<RotatedEdgeTemplateModel>())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                FindTopCandidates(gradients, model, candidates, capacity, step);
+            }
+
+            candidates.Sort((left, right) => right.Score.CompareTo(left.Score));
+            return candidates.Take(capacity).ToList();
+        }
+
+        private void FindTopCandidates(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            List<MatchCandidate> candidates,
+            int capacity,
+            int step)
+        {
+            int minCenterX = -model.MinOffsetX;
+            int minCenterY = -model.MinOffsetY;
+            int maxCenterX = gradients.Width - 1 - model.MaxOffsetX;
+            int maxCenterY = gradients.Height - 1 - model.MaxOffsetY;
+            if (maxCenterX < minCenterX || maxCenterY < minCenterY)
+            {
+                return;
+            }
+
+            CandidateScoreContext scoreContext = CreateScoreContext(gradients, model);
+            step = Math.Max(1, step);
+            if (owner.computeSession?.RequestedCuda == true)
+            {
+                // Tracking only changes this list, never the candidate objects from earlier models.
+                List<MatchCandidate> staged = new List<MatchCandidate>(candidates);
+                if (TryScoreGrid(scoreContext, minCenterX, minCenterY, maxCenterX, maxCenterY, step, (x, y, score) =>
+                {
+                    if (ShouldTrackCandidateSeed(staged, score, capacity, x, y))
+                        TrackCandidateSeed(staged, CreateMatchCandidate(model, x, y, CreateLocalBounds(x, y, model), score), capacity);
+                }))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    candidates.Clear(); candidates.AddRange(staged);
+                    return;
+                }
+            }
+            for (int y = minCenterY; y <= maxCenterY; y += step)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                for (int x = minCenterX; x <= maxCenterX; x += step)
+                {
+                    if ((x & 31) == 0)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+
+                    double score = ScoreCandidate(scoreContext, x, y);
+                    if (!ShouldTrackCandidateSeed(candidates, score, capacity, x, y))
+                    {
+                        continue;
+                    }
+
+                    RectangleF bounds = CreateLocalBounds(x, y, model);
+                    TrackCandidateSeed(candidates, CreateMatchCandidate(model, x, y, bounds, score), capacity);
+                }
+            }
+        }
+
+        public List<MatchCandidate> FindPoseAlternatives(GradientImage gradients, TemplateModelCache modelCache, MatchCandidate selected, double distanceThreshold)
+        {
+            // Every configured pose is revisited locally; global Top-K and coarse/pyramid proposals cannot hide it.
+            List<RotatedEdgeTemplateModel> models = GetSearchModels(modelCache, property.FIND_ANGLE);
+            candidateDiagnostics.PoseMatchCheckedModelCount = models.Count;
+            List<MatchCandidate> alternatives = new List<MatchCandidate>();
+            foreach (RotatedEdgeTemplateModel model in models)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (GetPoseAngleDifference(selected.Angle, model.Angle) < owner.PoseMatchMinAngleDifferenceDegrees
+                    && GetPoseRelativeScaleDifference(selected.Scale, model.Scale) < owner.PoseMatchMinRelativeScaleDifference)
+                {
+                    continue;
+                }
+
+                int centerX = (int)Math.Round(selected.TemplateCenter.X - model.TemplateCenterOffsetX);
+                int centerY = (int)Math.Round(selected.TemplateCenter.Y - model.TemplateCenterOffsetY);
+                MatchCandidate alternative = FindBestCandidateNear(gradients, model, null, centerX, centerY,
+                    (int)Math.Ceiling(distanceThreshold), selected.TemplateCenter, distanceThreshold);
+                if (alternative != null && alternative.Score >= property.SCORE_MIN) alternatives.Add(alternative);
+            }
+            return alternatives;
+        }
+
+        private MatchCandidate FindBestCandidateNear(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            List<RectangleF> suppressedBounds,
+            int centerX,
+            int centerY,
+            int radius,
+            Point2d? referenceTemplateCenter = null,
+            double maxCenterDistance = 0D)
+        {
+            int minCenterX = Math.Max(-model.MinOffsetX, centerX - radius);
+            int minCenterY = Math.Max(-model.MinOffsetY, centerY - radius);
+            int maxCenterX = Math.Min(gradients.Width - 1 - model.MaxOffsetX, centerX + radius);
+            int maxCenterY = Math.Min(gradients.Height - 1 - model.MaxOffsetY, centerY + radius);
+            if (maxCenterX < minCenterX || maxCenterY < minCenterY)
+            {
+                return null;
+            }
+
+            bool hasSuppressedBounds = HasSuppressedBounds(suppressedBounds);
+            CandidateScoreContext scoreContext = CreateScoreContext(gradients, model);
+            MatchCandidate best = null;
+            for (int y = minCenterY; y <= maxCenterY; y++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                for (int x = minCenterX; x <= maxCenterX; x++)
+                {
+                    if ((x & 31) == 0)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+
+                    if (referenceTemplateCenter.HasValue)
+                    {
+                        double dx = x + model.TemplateCenterOffsetX - referenceTemplateCenter.Value.X;
+                        double dy = y + model.TemplateCenterOffsetY - referenceTemplateCenter.Value.Y;
+                        if (dx * dx + dy * dy >= maxCenterDistance * maxCenterDistance) continue;
+                    }
+
+                    RectangleF bounds = CreateLocalBounds(x, y, model);
+                    if (hasSuppressedBounds && IsSuppressed(bounds, suppressedBounds))
+                    {
+                        continue;
+                    }
+
+                    double score = ScoreCandidate(scoreContext, x, y);
+                    if (IsBetterScore(score, x, y, best))
+                    {
+                        best = CreateMatchCandidate(model, x, y, bounds, score);
+                    }
+                }
+            }
+
+            return best;
+        }
+
+        private Mat ResizeForPyramidProposal(Mat source, double scale)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Mat resized = new Mat();
+            try
+            {
+                Cv2.Resize(
+                    source,
+                    resized,
+                    new OpenCvSharp.Size(
+                        Math.Max(1, (int)Math.Round(source.Width * scale)),
+                        Math.Max(1, (int)Math.Round(source.Height * scale))),
+                    0D,
+                    0D,
+                    InterpolationFlags.Area);
+                cancellationToken.ThrowIfCancellationRequested();
+                return resized;
+            }
+            catch
+            {
+                resized.Dispose();
+                throw;
+            }
+        }
+
+        private MatchCandidate FindBestCandidateFromModels(
+            GradientImage gradients,
+            IEnumerable<RotatedEdgeTemplateModel> searchModels,
+            List<RectangleF> suppressedBounds,
+            out List<MatchCandidate> candidateSeeds)
+        {
+            RotatedEdgeTemplateModel[] models = (searchModels ?? Enumerable.Empty<RotatedEdgeTemplateModel>()).ToArray();
+            if (models.Length == 0)
+            {
+                candidateSeeds = null;
+                return null;
+            }
+
+            int seedCapacity = GetCandidateSeedCapacity();
+            candidateSeeds = seedCapacity > 0 ? new List<MatchCandidate>(seedCapacity) : null;
+            if (ShouldUseParallelModelSearch(models.Length))
+            {
+                object sync = new object();
+                List<MatchCandidate> mergedSeeds = candidateSeeds;
+                MatchCandidate parallelBest = null;
+                Parallel.ForEach(models, new ParallelOptions { CancellationToken = cancellationToken }, searchModel =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    List<MatchCandidate> modelSeeds;
+                    MatchCandidate candidate = FindBestCandidate(
+                        gradients,
+                        searchModel,
+                        suppressedBounds,
+                        false,
+                        out modelSeeds);
+                    if (candidate == null)
+                    {
+                        return;
+                    }
+
+                    lock (sync)
+                    {
+                        if (IsBetterCandidate(candidate, parallelBest))
+                        {
+                            parallelBest = candidate;
+                        }
+
+                        MergeCandidateSeeds(mergedSeeds, modelSeeds, seedCapacity);
+                        TrackCandidateSeed(mergedSeeds, candidate, seedCapacity);
+                    }
+                });
+
+                candidateSeeds = mergedSeeds;
+                return parallelBest;
+            }
+
+            MatchCandidate best = null;
+            foreach (RotatedEdgeTemplateModel searchModel in models)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                List<MatchCandidate> modelSeeds;
+                MatchCandidate candidate = FindBestCandidate(
+                    gradients,
+                    searchModel,
+                    suppressedBounds,
+                    true,
+                    out modelSeeds);
+                if (IsBetterCandidate(candidate, best))
+                {
+                    best = candidate;
+                }
+
+                MergeCandidateSeeds(candidateSeeds, modelSeeds, seedCapacity);
+                TrackCandidateSeed(candidateSeeds, candidate, seedCapacity);
+            }
+
+            return best;
+        }
+
+        private List<MatchCandidate> FindCandidatesFromModels(
+            GradientImage gradients,
+            IEnumerable<RotatedEdgeTemplateModel> searchModels,
+            List<RectangleF> suppressedBounds)
+        {
+            RotatedEdgeTemplateModel[] models = (searchModels ?? Enumerable.Empty<RotatedEdgeTemplateModel>()).ToArray();
+            if (models.Length == 0)
+            {
+                return new List<MatchCandidate>();
+            }
+
+            List<MatchCandidate> candidates = new List<MatchCandidate>(models.Length);
+            if (ShouldUseParallelModelSearch(models.Length))
+            {
+                object sync = new object();
+                Parallel.ForEach(models, new ParallelOptions { CancellationToken = cancellationToken }, searchModel =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    MatchCandidate candidate = FindBestCandidate(gradients, searchModel, suppressedBounds, false);
+                    if (candidate == null)
+                    {
+                        return;
+                    }
+
+                    lock (sync)
+                    {
+                        candidates.Add(candidate);
+                    }
+                });
+
+                return candidates;
+            }
+
+            foreach (RotatedEdgeTemplateModel model in models)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                MatchCandidate candidate = FindBestCandidate(gradients, model, suppressedBounds, true);
+                if (candidate != null)
+                {
+                    candidates.Add(candidate);
+                }
+            }
+
+            return candidates;
+        }
+
+        private MatchCandidate FindBestCandidateCoarseToFine(
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            List<RectangleF> suppressedBounds,
+            out List<MatchCandidate> candidateSeeds)
+        {
+            // Wide angle ranges are expensive because each angle scans all candidate centers.
+            // Coarse-to-fine keeps accuracy by refining only around the best coarse angles.
+            double coarseStep = Math.Max(property.FIND_ANGLE, property.COARSE_ANGLE_STEP);
+            List<MatchCandidate> coarseCandidates = FindCandidatesFromModels(
+                gradients,
+                GetSearchModels(modelCache, coarseStep),
+                suppressedBounds);
+
+            MatchCandidate[] coarseBest = coarseCandidates
+                .OrderByDescending(candidate => candidate.Score)
+                .Take(Math.Max(1, property.COARSE_ANGLE_TOP_K))
+                .ToArray();
+            if (coarseBest.Length == 0)
+            {
+                candidateSeeds = null;
+                return null;
+            }
+
+            Dictionary<string, RotatedEdgeTemplateModel> fineModels = new Dictionary<string, RotatedEdgeTemplateModel>(StringComparer.Ordinal);
+            double fineRadius = coarseStep / 2D;
+            foreach (MatchCandidate coarseCandidate in coarseBest)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                foreach (double angle in CreateSearchAnglesAround(coarseCandidate.Angle, fineRadius, property.FIND_ANGLE))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    double normalizedAngle = Math.Round(angle, 6);
+                    double normalizedScale = NormalizeScale(coarseCandidate.Scale);
+                    string modelKey = CreateAngleScaleKey(normalizedAngle, normalizedScale);
+                    if (!fineModels.ContainsKey(modelKey))
+                    {
+                        fineModels[modelKey] = modelCache.GetRotatedModel(normalizedAngle, normalizedScale);
+                    }
+                }
+            }
+
+            MatchCandidate fineBest = FindBestCandidateFromModels(
+                gradients,
+                fineModels.Values,
+                suppressedBounds,
+                out candidateSeeds);
+            if (candidateSeeds == null || candidateSeeds.Count == 0)
+            {
+                int seedCapacity = GetCandidateSeedCapacity();
+                candidateSeeds = seedCapacity > 0 ? new List<MatchCandidate>(seedCapacity) : null;
+                foreach (MatchCandidate coarseCandidate in coarseBest)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    TrackCandidateSeed(candidateSeeds, coarseCandidate, seedCapacity);
+                }
+            }
+
+            return fineBest ?? coarseBest[0];
+        }
+
+        private MatchCandidate FindBestCandidate(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            List<RectangleF> suppressedBounds)
+        {
+            return FindBestCandidate(gradients, model, suppressedBounds, true);
+        }
+
+        private MatchCandidate FindBestCandidate(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            List<RectangleF> suppressedBounds,
+            bool allowPositionParallel)
+        {
+            List<MatchCandidate> candidateSeeds;
+            return FindBestCandidate(gradients, model, suppressedBounds, allowPositionParallel, out candidateSeeds);
+        }
+
+        private MatchCandidate FindBestCandidate(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            List<RectangleF> suppressedBounds,
+            bool allowPositionParallel,
+            out List<MatchCandidate> candidateSeeds)
+        {
+            int minCenterX = -model.MinOffsetX;
+            int minCenterY = -model.MinOffsetY;
+            int maxCenterX = gradients.Width - 1 - model.MaxOffsetX;
+            int maxCenterY = gradients.Height - 1 - model.MaxOffsetY;
+
+            if (maxCenterX < minCenterX || maxCenterY < minCenterY)
+            {
+                candidateSeeds = null;
+                return null;
+            }
+
+            MatchCandidate best = null;
+            int step = Math.Max(1, property.SEARCH_STEP);
+            bool usePositionRefine = property.USE_POSITION_REFINE && step > 1;
+            int seedCapacity = GetCandidateSeedCapacity();
+            bool useSpatialSeeds = ShouldUseHybridSpatialSeeds();
+            bool hasSuppressedBounds = HasSuppressedBounds(suppressedBounds);
+            CandidateScoreContext scoreContext = CreateScoreContext(gradients, model);
+            CandidateSearchState gpuState = null;
+            if (owner.computeSession?.RequestedCuda == true)
+            {
+                CandidateSearchState staged = new CandidateSearchState(seedCapacity, useSpatialSeeds, minCenterX, minCenterY, maxCenterX, maxCenterY);
+                if (TryScoreGrid(scoreContext, minCenterX, minCenterY, maxCenterX, maxCenterY, step, (x, y, score) =>
+                {
+                    if (!hasSuppressedBounds || !IsSuppressed(CreateLocalBounds(x, y, model), suppressedBounds)) staged.Consider(model, x, y, score);
+                })) gpuState = staged;
+            }
+            if (gpuState == null && allowPositionParallel && ShouldUseParallelPositionSearch(minCenterX, minCenterY, maxCenterX, maxCenterY, step))
+            {
+                long cpuSearchStart = owner.StartPhaseTiming();
+                best = FindBestCandidateParallelPositions(
+                    gradients,
+                    model,
+                    scoreContext,
+                    suppressedBounds,
+                    minCenterX,
+                    minCenterY,
+                    maxCenterX,
+                    maxCenterY,
+                    step,
+                    seedCapacity,
+                    useSpatialSeeds,
+                    hasSuppressedBounds,
+                    out candidateSeeds,
+                    cancellationToken);
+                owner.StopPhaseTiming("SearchCpuParallelPositions", cpuSearchStart);
+                if (usePositionRefine && best != null)
+                {
+                    best = RefineBestCandidate(
+                        gradients,
+                        model,
+                        scoreContext,
+                        suppressedBounds,
+                        candidateSeeds,
+                        best,
+                        minCenterX,
+                        minCenterY,
+                        maxCenterX,
+                        maxCenterY,
+                        step,
+                        cancellationToken);
+                }
+
+                TrackCandidateSeed(candidateSeeds, best, seedCapacity);
+                return best;
+            }
+
+            candidateSeeds = gpuState != null ? gpuState.CandidateSeeds : seedCapacity > 0 ? new List<MatchCandidate>(seedCapacity) : null;
+            SpatialCandidateSeedTracker spatialSeeds = gpuState == null && useSpatialSeeds
+                ? new SpatialCandidateSeedTracker(
+                    minCenterX,
+                    minCenterY,
+                    maxCenterX,
+                    maxCenterY,
+                    HybridCandidateGridColumns,
+                    HybridCandidateGridRows,
+                    HybridCandidateGridTopK)
+                : null;
+
+            if (gpuState == null)
+            {
+                for (int y = minCenterY; y <= maxCenterY; y += step)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    for (int x = minCenterX; x <= maxCenterX; x += step)
+                    {
+                        if ((x & 31) == 0)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                        }
+
+                        RectangleF bounds = default;
+                        bool boundsCreated = false;
+                        if (hasSuppressedBounds)
+                        {
+                            bounds = CreateLocalBounds(x, y, model);
+                            boundsCreated = true;
+                            if (IsSuppressed(bounds, suppressedBounds))
+                            {
+                                continue;
+                            }
+                        }
+
+                        double score = ScoreCandidate(scoreContext, x, y);
+                        MatchCandidate candidate = null;
+                        bool shouldTrackSeed = ShouldTrackCandidateSeed(candidateSeeds, score, seedCapacity, x, y);
+                        bool shouldTrackSpatialSeed = spatialSeeds?.ShouldTrack(x, y, score) ?? false;
+                        if (IsBetterScore(score, x, y, best))
+                        {
+                            candidate = CreateMatchCandidate(
+                                model,
+                                x,
+                                y,
+                                EnsureBounds(model, x, y, ref bounds, ref boundsCreated),
+                                score);
+                            best = candidate;
+                        }
+
+                        if (shouldTrackSeed)
+                        {
+                            candidate = candidate ?? CreateMatchCandidate(
+                                model,
+                                x,
+                                y,
+                                EnsureBounds(model, x, y, ref bounds, ref boundsCreated),
+                                score);
+                            TrackCandidateSeed(candidateSeeds, candidate, seedCapacity);
+                        }
+
+                        if (shouldTrackSpatialSeed)
+                        {
+                            candidate = candidate ?? CreateMatchCandidate(
+                                model,
+                                x,
+                                y,
+                                EnsureBounds(model, x, y, ref bounds, ref boundsCreated),
+                                score);
+                            spatialSeeds.Track(candidate);
+                        }
+                    }
+                }
+            }
+            else best = gpuState.Best;
+
+            if (usePositionRefine && best != null)
+            {
+                best = RefineBestCandidate(
+                    gradients,
+                    model,
+                    scoreContext,
+                    suppressedBounds,
+                    candidateSeeds,
+                    best,
+                    minCenterX,
+                    minCenterY,
+                    maxCenterX,
+                    maxCenterY,
+                    step,
+                    cancellationToken);
+            }
+
+            if (gpuState != null) gpuState.CreateMergedCandidateSeeds();
+            else MergeCandidateSeeds(candidateSeeds, spatialSeeds?.GetCandidates(), seedCapacity);
+            TrackCandidateSeed(candidateSeeds, best, seedCapacity);
+            return best;
+        }
+
+        private MatchCandidate FindBestCandidateParallelPositions(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            CandidateScoreContext scoreContext,
+            List<RectangleF> suppressedBounds,
+            int minCenterX,
+            int minCenterY,
+            int maxCenterX,
+            int maxCenterY,
+            int step,
+            int seedCapacity,
+            bool useSpatialSeeds,
+            bool hasSuppressedBounds,
+            out List<MatchCandidate> candidateSeeds,
+            CancellationToken cancellationToken)
+        {
+            int rowCount = ((maxCenterY - minCenterY) / step) + 1;
+            object sync = new object();
+            CandidateSearchState globalState = new CandidateSearchState(
+                seedCapacity,
+                useSpatialSeeds,
+                minCenterX,
+                minCenterY,
+                maxCenterX,
+                maxCenterY);
+
+            Parallel.For(
+                0,
+                rowCount,
+                new ParallelOptions { CancellationToken = cancellationToken },
+                () => new CandidateSearchState(
+                    seedCapacity,
+                    useSpatialSeeds,
+                    minCenterX,
+                    minCenterY,
+                    maxCenterX,
+                    maxCenterY),
+                (rowIndex, loopState, localState) =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    int y = minCenterY + (rowIndex * step);
+                    for (int x = minCenterX; x <= maxCenterX; x += step)
+                    {
+                        if ((x & 31) == 0)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                        }
+
+                        if (hasSuppressedBounds
+                            && IsSuppressed(CreateLocalBounds(x, y, model), suppressedBounds))
+                        {
+                            continue;
+                        }
+
+                        double score = ScoreCandidate(scoreContext, x, y);
+                        localState.Consider(model, x, y, score);
+                    }
+
+                    return localState;
+                },
+                localState =>
+                {
+                    lock (sync)
+                    {
+                        globalState.Merge(localState);
+                    }
+                });
+
+            candidateSeeds = globalState.CreateMergedCandidateSeeds();
+            return globalState.Best;
+        }
+
+        private MatchCandidate RefineBestCandidate(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            CandidateScoreContext scoreContext,
+            List<RectangleF> suppressedBounds,
+            List<MatchCandidate> coarseSeeds,
+            MatchCandidate coarseBest,
+            int minCenterX,
+            int minCenterY,
+            int maxCenterX,
+            int maxCenterY,
+            int radius,
+            CancellationToken cancellationToken)
+        {
+            if (coarseSeeds == null || coarseSeeds.Count == 0)
+            {
+                return null;
+            }
+
+            MatchCandidate best = coarseSeeds.OrderByDescending(seed => seed.Score).ThenBy(seed => seed.Center.Y).ThenBy(seed => seed.Center.X).First();
+            // Parallel seed merge order must not replace the selected coarse winner at an exact tie.
+            if (coarseBest != null && (coarseBest.Score > best.Score || (coarseBest.Score == best.Score && IsBetterCandidate(coarseBest, best)))) best = coarseBest;
+            bool hasSuppressedBounds = HasSuppressedBounds(suppressedBounds);
+            foreach (MatchCandidate seed in coarseSeeds)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int coarseCenterX = (int)Math.Round(seed.Center.X);
+                int coarseCenterY = (int)Math.Round(seed.Center.Y);
+                int refineMinX = Math.Max(minCenterX, coarseCenterX - radius);
+                int refineMaxX = Math.Min(maxCenterX, coarseCenterX + radius);
+                int refineMinY = Math.Max(minCenterY, coarseCenterY - radius);
+                int refineMaxY = Math.Min(maxCenterY, coarseCenterY + radius);
+
+                for (int y = refineMinY; y <= refineMaxY; y++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    for (int x = refineMinX; x <= refineMaxX; x++)
+                    {
+                        RectangleF bounds = default;
+                        bool boundsCreated = false;
+                        if (hasSuppressedBounds)
+                        {
+                            bounds = CreateLocalBounds(x, y, model);
+                            boundsCreated = true;
+                            if (IsSuppressed(bounds, suppressedBounds))
+                            {
+                                continue;
+                            }
+                        }
+
+                        double score = ScoreCandidate(scoreContext, x, y);
+                        if (score > best.Score || (score == best.Score && IsBetterScore(score, x, y, best)))
+                        {
+                            best = CreateMatchCandidate(
+                                model,
+                                x,
+                                y,
+                                EnsureBounds(model, x, y, ref bounds, ref boundsCreated),
+                                score);
+                        }
+                    }
+                }
+            }
+
+            return best;
+        }
+
+        public MatchCandidate RefineCandidates(Mat source, GradientImage gradients, TemplateModelCache modelCache,
+            List<MatchCandidate> candidates, MatchCandidate fallback, MatchCandidate imageProposal)
+        {
+            MatchCandidate best = null;
+            foreach (MatchCandidate candidate in candidates.Concat(new[] { fallback, imageProposal }))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (candidate == null) continue;
+                RefinePose(source, gradients, modelCache, candidate);
+                if (IsBetterCandidate(candidate, best)) best = candidate;
+            }
+            return best;
+        }
+
+        private void RefinePose(Mat source, GradientImage gradients, TemplateModelCache modelCache, MatchCandidate candidate)
+        {
+            if (candidate.HasContinuousPoseScore) return;
+            bool plausible = candidate.Score >= property.SCORE_MIN;
+            EdgeTemplateModel model = modelCache.Model;
+            double signedScore = ScoreContinuousSigned(gradients, model, candidate.TemplateCenter, candidate.Angle, candidate.Scale);
+            SetContinuousPose(candidate, model, candidate.TemplateCenter, candidate.Angle, candidate.Scale, signedScore);
+            candidate.HasContinuousPoseScore = true;
+            candidate.ImageVerifyScore = candidate.DescriptorVerifyScore = candidate.HybridScore = double.NaN;
+            if (!plausible || source.Type() != MatType.CV_8UC1 || modelCache.PreparedTemplate.Type() != MatType.CV_8UC1) return;
+
+            double radius = Math.Sqrt((double)model.Width * model.Width + (double)model.Height * model.Height) * candidate.Scale / 2D
+                + Math.Max(4, property.SEARCH_STEP);
+            if (!IsFinite(radius)) return;
+            int left = (int)Math.Floor(Clamp(candidate.TemplateCenter.X - radius, 0D, source.Width));
+            int top = (int)Math.Floor(Clamp(candidate.TemplateCenter.Y - radius, 0D, source.Height));
+            int right = (int)Math.Ceiling(Clamp(candidate.TemplateCenter.X + radius, 0D, source.Width));
+            int bottom = (int)Math.Ceiling(Clamp(candidate.TemplateCenter.Y + radius, 0D, source.Height));
+            if (right <= left || bottom <= top) return;
+
+            using (Mat patch = new Mat(source, new Rect(left, top, right - left, bottom - top)))
+            using (Mat inverted = new Mat())
+            using (Mat warp = new Mat(2, 3, MatType.CV_32FC1))
+            {
+                double radians = candidate.Angle * Math.PI / 180D;
+                double a = candidate.Scale * Math.Cos(radians);
+                double b = candidate.Scale * Math.Sin(radians);
+                warp.Set(0, 0, (float)a);
+                warp.Set(0, 1, (float)b);
+                warp.Set(1, 0, (float)-b);
+                warp.Set(1, 1, (float)a);
+                warp.Set(0, 2, (float)(candidate.TemplateCenter.X - left - a * model.Width / 2D - b * model.Height / 2D));
+                warp.Set(1, 2, (float)(candidate.TemplateCenter.Y - top + b * model.Width / 2D - a * model.Height / 2D));
+                cancellationToken.ThrowIfCancellationRequested();
+                if (candidate.PolarityReversed) Cv2.BitwiseNot(patch, inverted);
+                candidateDiagnostics.PoseRefinementAttemptCount++;
+                try
+                {
+                    // ponytail: bounded native ECC is cooperative before/after each call; a cancellable optimizer needs a native seam.
+                    double correlation = Cv2.FindTransformECC(modelCache.PreparedTemplate, candidate.PolarityReversed ? inverted : patch,
+                        warp, MotionTypes.Affine, new TermCriteria(CriteriaType.Count | CriteriaType.Eps, owner.PoseRefinementMaximumIterations, owner.PoseRefinementEpsilon));
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!IsFinite(correlation)) return;
+                }
+                catch (OpenCVException)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    candidateDiagnostics.PoseRefinementNativeFailureCount++;
+                    return;
+                }
+                a = ((double)warp.At<float>(0, 0) + warp.At<float>(1, 1)) / 2D;
+                b = ((double)warp.At<float>(0, 1) - warp.At<float>(1, 0)) / 2D;
+                double angle = Math.Atan2(b, a) * 180D / Math.PI;
+                angle += 360D * Math.Round((candidate.Angle - angle) / 360D);
+                double scale = Math.Sqrt(a * a + b * b);
+                if (!property.USE_FIND_ANGLE) angle = 0D;
+                if (!property.USE_FIND_SCALE) scale = 1D;
+                Point2d center = new Point2d(
+                    warp.At<float>(0, 0) * model.Width / 2D + warp.At<float>(0, 1) * model.Height / 2D + warp.At<float>(0, 2) + left,
+                    warp.At<float>(1, 0) * model.Width / 2D + warp.At<float>(1, 1) * model.Height / 2D + warp.At<float>(1, 2) + top);
+                if (!IsFinite(angle) || !IsFinite(scale) || scale <= 0D || !IsFinite(center.X) || !IsFinite(center.Y)
+                    || (property.USE_FIND_ANGLE && (angle < property.FIND_ANGLE_MIN || angle > property.FIND_ANGLE_MAX
+                        || Math.Abs(angle - candidate.Angle) > property.FIND_ANGLE))
+                    || (property.USE_FIND_SCALE && (scale < property.FIND_SCALE_MIN || scale > property.FIND_SCALE_MAX
+                        || Math.Abs(scale - candidate.Scale) > property.FIND_SCALE_STEP))
+                    || Math.Abs(center.X - candidate.TemplateCenter.X) > Math.Max(2, property.SEARCH_STEP)
+                    || Math.Abs(center.Y - candidate.TemplateCenter.Y) > Math.Max(2, property.SEARCH_STEP)) return;
+
+                signedScore = ScoreContinuousSigned(gradients, model, center, angle, scale);
+                double score = property.ALLOW_GLOBAL_POLARITY_REVERSAL ? Math.Abs(signedScore) : signedScore;
+                if (score + 0.0000001D < candidate.Score) return;
+                SetContinuousPose(candidate, model, center, angle, scale, signedScore);
+                candidateDiagnostics.PoseRefinementAcceptedCount++;
+            }
+        }
+
+        private void SetContinuousPose(MatchCandidate candidate, EdgeTemplateModel model, Point2d center, double angle, double scale, double signedScore)
+        {
+            double radians = angle * Math.PI / 180D;
+            double cos = Math.Cos(radians);
+            double sin = Math.Sin(radians);
+            double offsetX = model.Center.X - model.Width / 2D;
+            double offsetY = model.Center.Y - model.Height / 2D;
+            candidate.Center = new Point2d(center.X + scale * (offsetX * cos + offsetY * sin), center.Y + scale * (-offsetX * sin + offsetY * cos));
+            RectangleF bounds = CreateRotatedTemplateBounds(model, cos, sin);
+            candidate.Bounds = new RectangleF((float)(candidate.Center.X + bounds.X * scale), (float)(candidate.Center.Y + bounds.Y * scale),
+                (float)(bounds.Width * scale), (float)(bounds.Height * scale));
+            candidate.TemplateCenter = center;
+            candidate.Angle = angle;
+            candidate.Scale = scale;
+            candidate.Score = property.ALLOW_GLOBAL_POLARITY_REVERSAL ? Math.Abs(signedScore) : signedScore;
+            candidate.PolarityReversed = property.ALLOW_GLOBAL_POLARITY_REVERSAL && signedScore < 0D;
+            candidate.Width = Math.Max(1, (int)Math.Round(model.Width * scale));
+            candidate.Height = Math.Max(1, (int)Math.Round(model.Height * scale));
+        }
+
+        private double ScoreContinuousSigned(GradientImage gradients, EdgeTemplateModel model, Point2d center, double angle, double scale)
+        {
+            double radians = angle * Math.PI / 180D;
+            double cos = Math.Cos(radians);
+            double sin = Math.Sin(radians);
+            double sum = 0D;
+            for (int i = 0; i < model.Points.Count; i++)
+            {
+                if ((i & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
+                TemplateEdgePoint point = model.Points[i];
+                double px = point.X - model.Width / 2D;
+                double py = point.Y - model.Height / 2D;
+                double x = center.X + scale * (px * cos + py * sin);
+                double y = center.Y + scale * (-px * sin + py * cos);
+                if (x < 0D || y < 0D || x > gradients.Width - 1 || y > gradients.Height - 1) continue;
+                int x0 = (int)Math.Floor(x);
+                int y0 = (int)Math.Floor(y);
+                int x1 = Math.Min(x0 + 1, gradients.Width - 1);
+                int y1 = Math.Min(y0 + 1, gradients.Height - 1);
+                double fx = x - x0;
+                double fy = y - y0;
+                double dx = InterpolateUnitComponent(gradients.UnitDxValues, gradients.Width, x0, y0, x1, y1, fx, fy);
+                double dy = InterpolateUnitComponent(gradients.UnitDyValues, gradients.Width, x0, y0, x1, y1, fx, fy);
+                double magnitude = Math.Sqrt(dx * dx + dy * dy);
+                if (magnitude > 0D)
+                    sum += (dx * (point.UnitDx * cos + point.UnitDy * sin) + dy * (-point.UnitDx * sin + point.UnitDy * cos)) / magnitude;
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            return sum / model.Points.Count;
+        }
+
+        private static double InterpolateUnitComponent(double[] values, int width, int x0, int y0, int x1, int y1, double fx, double fy) =>
+            (values[y0 * width + x0] * (1D - fx) + values[y0 * width + x1] * fx) * (1D - fy)
+            + (values[y1 * width + x0] * (1D - fx) + values[y1 * width + x1] * fx) * fy;
+
+        public MatchCandidate ApplySubpixelRefinement(
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            MatchCandidate candidate)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (property?.USE_SUBPIXEL_REFINE != true
+                || candidate == null || candidate.HasContinuousPoseScore
+                || gradients == null
+                || modelCache == null)
+            {
+                return candidate;
+            }
+
+            RotatedEdgeTemplateModel model = modelCache.GetRotatedModel(candidate.Angle, candidate.Scale);
+            int centerX = (int)Math.Round(candidate.Center.X);
+            int centerY = (int)Math.Round(candidate.Center.Y);
+            if (!CanScoreSubpixelNeighborhood(gradients, model, centerX, centerY))
+            {
+                return candidate;
+            }
+
+            CandidateScoreContext scoreContext = CreateScoreContext(gradients, model);
+            double centerScore = ScoreCandidate(scoreContext, centerX, centerY);
+            double leftScore = ScoreCandidate(scoreContext, centerX - 1, centerY);
+            double rightScore = ScoreCandidate(scoreContext, centerX + 1, centerY);
+            double topScore = ScoreCandidate(scoreContext, centerX, centerY - 1);
+            double bottomScore = ScoreCandidate(scoreContext, centerX, centerY + 1);
+            double offsetX = EstimateSubpixelOffset(leftScore, centerScore, rightScore);
+            double offsetY = EstimateSubpixelOffset(topScore, centerScore, bottomScore);
+            if (Math.Abs(offsetX) <= 0.000001D && Math.Abs(offsetY) <= 0.000001D)
+            {
+                return candidate;
+            }
+
+            return CreateSubpixelCandidate(candidate, model, centerX + offsetX, centerY + offsetY);
+        }
+
+        private static bool CanScoreSubpixelNeighborhood(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            int centerX,
+            int centerY)
+        {
+            return centerX - 1 + model.MinOffsetX >= 0
+                && centerY - 1 + model.MinOffsetY >= 0
+                && centerX + 1 + model.MaxOffsetX < gradients.Width
+                && centerY + 1 + model.MaxOffsetY < gradients.Height;
+        }
+
+        private static double EstimateSubpixelOffset(double previousScore, double centerScore, double nextScore)
+        {
+            double denominator = previousScore - (2D * centerScore) + nextScore;
+            if (Math.Abs(denominator) <= 0.0000001D)
+            {
+                return 0D;
+            }
+
+            double offset = 0.5D * (previousScore - nextScore) / denominator;
+            return Clamp(offset, -0.5D, 0.5D);
+        }
+
+        private static MatchCandidate CreateSubpixelCandidate(
+            MatchCandidate candidate,
+            RotatedEdgeTemplateModel model,
+            double refinedCenterX,
+            double refinedCenterY)
+        {
+            double dx = refinedCenterX - candidate.Center.X;
+            double dy = refinedCenterY - candidate.Center.Y;
+            return new MatchCandidate
+            {
+                Center = new Point2d(refinedCenterX, refinedCenterY),
+                TemplateCenter = new Point2d(
+                    refinedCenterX + model.TemplateCenterOffsetX,
+                    refinedCenterY + model.TemplateCenterOffsetY),
+                Bounds = new RectangleF(
+                    (float)(candidate.Bounds.X + dx),
+                    (float)(candidate.Bounds.Y + dy),
+                    candidate.Bounds.Width,
+                    candidate.Bounds.Height),
+                Score = candidate.Score,
+                ImageVerifyScore = candidate.ImageVerifyScore,
+                DescriptorVerifyScore = candidate.DescriptorVerifyScore,
+                HybridScore = candidate.HybridScore,
+                PolarityReversed = candidate.PolarityReversed,
+                Angle = candidate.Angle,
+                Scale = candidate.Scale,
+                Width = candidate.Width,
+                Height = candidate.Height
+            };
+        }
+
+        private static bool HasSuppressedBounds(List<RectangleF> suppressedBounds)
+        {
+            return suppressedBounds != null && suppressedBounds.Count > 0;
+        }
+
+        private static RectangleF EnsureBounds(
+            RotatedEdgeTemplateModel model,
+            int centerX,
+            int centerY,
+            ref RectangleF bounds,
+            ref bool boundsCreated)
+        {
+            if (!boundsCreated)
+            {
+                bounds = CreateLocalBounds(centerX, centerY, model);
+                boundsCreated = true;
+            }
+
+            return bounds;
+        }
+
+        public static bool ShouldTrackCandidateSeed(List<MatchCandidate> seeds, double score, int capacity, double centerX, double centerY)
+        {
+            return seeds != null
+                && capacity > 0
+                && (seeds.Count < capacity
+                || score > seeds[seeds.Count - 1].Score
+                || (score == seeds[seeds.Count - 1].Score && IsBetterScore(score, centerX, centerY, seeds[seeds.Count - 1])));
+        }
+
+        private static bool ShouldUseParallelModelSearch(int modelCount)
+        {
+            return Environment.ProcessorCount > 1 && modelCount >= ParallelModelThreshold;
+        }
+
+        private static bool ShouldUseParallelPositionSearch(
+            int minCenterX,
+            int minCenterY,
+            int maxCenterX,
+            int maxCenterY,
+            int step)
+        {
+            if (Environment.ProcessorCount <= 1)
+            {
+                return false;
+            }
+
+            int columnCount = ((maxCenterX - minCenterX) / step) + 1;
+            int rowCount = ((maxCenterY - minCenterY) / step) + 1;
+            return columnCount * rowCount >= ParallelPositionThreshold;
+        }
+
+        public static bool IsBetterCandidate(MatchCandidate candidate, MatchCandidate currentBest)
+        {
+            if (candidate == null)
+            {
+                return false;
+            }
+
+            return IsBetterScore(candidate.Score, candidate.Center.X, candidate.Center.Y, currentBest);
+        }
+
+        public static bool IsBetterScore(double score, double centerX, double centerY, MatchCandidate currentBest)
+        {
+            if (currentBest == null)
+            {
+                return true;
+            }
+
+            const double epsilon = 0.0000001D;
+            if (score > currentBest.Score + epsilon)
+            {
+                return true;
+            }
+
+            if (Math.Abs(score - currentBest.Score) > epsilon)
+            {
+                return false;
+            }
+
+            if (centerY < currentBest.Center.Y)
+            {
+                return true;
+            }
+
+            return Math.Abs(centerY - currentBest.Center.Y) <= epsilon
+                && centerX < currentBest.Center.X;
+        }
+
+        private static int CompareCandidateSeeds(MatchCandidate left, MatchCandidate right)
+        {
+            int scoreOrder = right.Score.CompareTo(left.Score);
+            if (scoreOrder != 0) return scoreOrder;
+            int rowOrder = left.Center.Y.CompareTo(right.Center.Y);
+            return rowOrder != 0 ? rowOrder : left.Center.X.CompareTo(right.Center.X);
+        }
+
+        public static void TrackCandidateSeed(List<MatchCandidate> seeds, MatchCandidate candidate, int capacity)
+        {
+            if (seeds == null || candidate == null || capacity <= 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < seeds.Count; i++)
+            {
+                if (IsSameCandidate(seeds[i], candidate))
+                {
+                    if (candidate.Score > seeds[i].Score)
+                    {
+                        seeds[i] = candidate;
+                    }
+
+                    seeds.Sort(CompareCandidateSeeds);
+                    return;
+                }
+            }
+
+            seeds.Add(candidate);
+            seeds.Sort(CompareCandidateSeeds);
+            if (seeds.Count > capacity)
+            {
+                seeds.RemoveAt(seeds.Count - 1);
+            }
+        }
+
+        public static void MergeCandidateSeeds(List<MatchCandidate> target, IEnumerable<MatchCandidate> source, int capacity)
+        {
+            if (target == null || source == null || capacity <= 0)
+            {
+                return;
+            }
+
+            foreach (MatchCandidate candidate in source)
+            {
+                TrackCandidateSeed(target, candidate, capacity);
+            }
+        }
+
+        public static bool IsSameCandidate(MatchCandidate left, MatchCandidate right)
+        {
+            return left != null
+                && right != null
+                && Math.Abs(left.TemplateCenter.X - right.TemplateCenter.X) < 0.5D
+                && Math.Abs(left.TemplateCenter.Y - right.TemplateCenter.Y) < 0.5D
+                && Math.Abs(left.Angle - right.Angle) < 0.0001D
+                && Math.Abs(left.Scale - right.Scale) < 0.0001D;
+        }
+
+        public static MatchCandidate CreateMatchCandidate(
+            RotatedEdgeTemplateModel model,
+            int centerX,
+            int centerY,
+            RectangleF bounds,
+            double score)
+        {
+            return new MatchCandidate
+            {
+                Center = new Point2d(centerX, centerY),
+                TemplateCenter = new Point2d(centerX + model.TemplateCenterOffsetX, centerY + model.TemplateCenterOffsetY),
+                Bounds = bounds,
+                Score = score,
+                Angle = model.Angle,
+                Scale = model.Scale,
+                Width = model.TemplateWidth,
+                Height = model.TemplateHeight
+            };
+        }
+
+        public double ScoreCandidate(GradientImage gradients, RotatedEdgeTemplateModel model, int centerX, int centerY)
+        {
+            return ScoreCandidate(CreateScoreContext(gradients, model), centerX, centerY);
+        }
+
+        private bool TryScoreGrid(CandidateScoreContext context, int minX, int minY, int maxX, int maxY, int step,
+            Action<int, int, double> consider)
+        {
+            if (owner.computeSession?.RequestedCuda != true || context.PointCount == 0) return false;
+            int columns = (maxX - minX) / step + 1;
+            int rows = (maxY - minY) / step + 1;
+            // Eligibility belongs to the complete grid; the final small tile must not restart CPU work.
+            if ((long)columns * rows < MinimumCudaGridPositions && !owner.computeSession.EvaluateUnqualifiedWorkloads)
+            {
+                lock (owner.phaseElapsedSync)
+                    if (owner.computeEvidence?.AccelerationApplied != true)
+                        owner.computeEvidence = owner.computeEvidence == null
+                            ? owner.computeSession.DescribeCpuExecution(CudaFallbackReason.WorkloadTooSmall, cancellationToken)
+                            : owner.computeEvidence.Combine(owner.computeSession.DescribeCpuExecution(CudaFallbackReason.WorkloadTooSmall, cancellationToken));
+                return false;
+            }
+            VisionComputeSession.EdgeScoreTile tile = new VisionComputeSession.EdgeScoreTile { CollectTimings = owner.CollectPhaseTimings };
+            bool applied = owner.computeSession.TryScoreEdgeTiles(context.SourceUnitDxValues, context.SourceUnitDyValues,
+                context.OffsetXValues, context.OffsetYValues, context.TemplateUnitDxValues, context.TemplateUnitDyValues, context.BreakSumThresholds,
+                context.ImageWidth, minX, minY, columns, rows, step, context.AllowGlobalPolarityReversal, tile, () =>
+                {
+                    for (int row = 0; row < tile.Rows; row++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        int y = tile.MinY + row * step;
+                        for (int column = 0; column < tile.Columns; column++)
+                        {
+                            int x = tile.MinX + column * step;
+                            if ((x & 31) == 0) cancellationToken.ThrowIfCancellationRequested();
+                            consider(x, y, tile.Scores[row * tile.Columns + column]);
+                        }
+                    }
+                }, cancellationToken, out ComputeExecutionEvidence evidence);
+            owner.AddPhaseTiming("SearchCudaLockWait", tile.LockWaitTicks);
+            owner.AddPhaseTiming("SearchCudaPreparation", tile.PreparationTicks);
+            owner.AddPhaseTiming("SearchCudaAllocation", tile.AllocationTicks);
+            owner.AddPhaseTiming("SearchCudaPacking", tile.PackingTicks);
+            owner.AddPhaseTiming("SearchCudaNativeCall", tile.NativeCallTicks);
+            owner.AddPhaseTiming("SearchCudaValidation", tile.ValidationTicks);
+            owner.AddPhaseTiming("SearchCudaCandidateConsumption", tile.ConsumptionTicks);
+            lock (owner.phaseElapsedSync) owner.computeEvidence = owner.computeEvidence == null ? evidence : owner.computeEvidence.Combine(evidence);
+            return applied;
+        }
+
+        private CandidateScoreContext CreateScoreContext(GradientImage gradients, RotatedEdgeTemplateModel model)
+        {
+            return new CandidateScoreContext(
+                gradients.Width,
+                model.PointCount,
+                model.GetIndexOffsets(gradients.Width),
+                model.OffsetXValues,
+                model.OffsetYValues,
+                model.UnitDxValues,
+                model.UnitDyValues,
+                gradients.UnitDxValues,
+                gradients.UnitDyValues,
+                CreateBreakSumThresholds(model.PointCount),
+                property.ALLOW_GLOBAL_POLARITY_REVERSAL);
+        }
+
+        private double[] CreateBreakSumThresholds(int pointCount)
+        {
+            double[] thresholds = new double[Math.Max(0, pointCount)];
+            if (pointCount <= 0)
+            {
+                return thresholds;
+            }
+
+            double minScore = property.SCORE_MIN;
+            double greediness = Clamp(property.GREEDINESS, 0d, 0.999d);
+            double normMinScore = minScore / pointCount;
+            double normGreediness = (1d - greediness * minScore) / (1d - greediness) / pointCount;
+            double minScoreMinusOne = minScore - 1d;
+            for (int i = 0; i < pointCount; i++)
+            {
+                if ((i & 255) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                int processed = i + 1;
+                double breakScore = Math.Min(
+                    minScoreMinusOne + normGreediness * processed,
+                    normMinScore * processed);
+                thresholds[i] = breakScore * processed;
+            }
+
+            return thresholds;
+        }
+
+        private static double ScoreCandidate(CandidateScoreContext context, int centerX, int centerY)
+        {
+            double partialSum = 0d;
+            int pointCount = context.PointCount;
+            if (pointCount <= 0)
+            {
+                return 0D;
+            }
+
+            int[] indexOffsets = context.IndexOffsets;
+            double[] templateUnitDxValues = context.TemplateUnitDxValues;
+            double[] templateUnitDyValues = context.TemplateUnitDyValues;
+            double[] sourceUnitDxValues = context.SourceUnitDxValues;
+            double[] sourceUnitDyValues = context.SourceUnitDyValues;
+            double[] breakSumThresholds = context.BreakSumThresholds;
+            int centerIndex = (centerY * context.ImageWidth) + centerX;
+
+            for (int i = 0; i < pointCount; i++)
+            {
+                int index = centerIndex + indexOffsets[i];
+                partialSum += (sourceUnitDxValues[index] * templateUnitDxValues[i])
+                    + (sourceUnitDyValues[index] * templateUnitDyValues[i]);
+
+                if (!context.AllowGlobalPolarityReversal
+                    && partialSum < breakSumThresholds[i])
+                {
+                    return partialSum / (i + 1);
+                }
+            }
+
+            return context.AllowGlobalPolarityReversal
+                ? Math.Abs(partialSum) / pointCount
+                : partialSum / pointCount;
+        }
+
+        public void ApplyGlobalPolarityState(
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            MatchCandidate candidate)
+        {
+            if (candidate == null)
+            {
+                return;
+            }
+
+            if (candidate.HasContinuousPoseScore) return;
+            candidate.PolarityReversed = false;
+            if (!property.ALLOW_GLOBAL_POLARITY_REVERSAL)
+            {
+                return;
+            }
+
+            RotatedEdgeTemplateModel model = modelCache.GetRotatedModel(candidate.Angle, candidate.Scale);
+            CandidateScoreContext context = CreateScoreContext(gradients, model);
+            candidate.PolarityReversed = ScoreCandidateSigned(
+                context,
+                (int)Math.Round(candidate.Center.X),
+                (int)Math.Round(candidate.Center.Y)) < 0D;
+        }
+
+        private static double ScoreCandidateSigned(
+            CandidateScoreContext context,
+            int centerX,
+            int centerY)
+        {
+            if (context.PointCount <= 0)
+            {
+                return 0D;
+            }
+
+            double sum = 0D;
+            int centerIndex = (centerY * context.ImageWidth) + centerX;
+            for (int i = 0; i < context.PointCount; i++)
+            {
+                int index = centerIndex + context.IndexOffsets[i];
+                sum += (context.SourceUnitDxValues[index] * context.TemplateUnitDxValues[i])
+                    + (context.SourceUnitDyValues[index] * context.TemplateUnitDyValues[i]);
+            }
+
+            return sum / context.PointCount;
+        }
+
+        public List<RotatedEdgeTemplateModel> GetSearchModels(TemplateModelCache modelCache, double angleStep)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return modelCache.GetSearchModels(
+                CreateSearchModelCacheKey(angleStep),
+                CreateSearchAngles(angleStep),
+                CreateSearchScales());
+        }
+
+        private string CreateSearchModelCacheKey(double angleStep)
+        {
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "Angle:{0}:{1}:{2}:{3}|Scale:{4}:{5}:{6}:{7}",
+                property.USE_FIND_ANGLE,
+                property.FIND_ANGLE_MIN,
+                property.FIND_ANGLE_MAX,
+                Math.Round(angleStep, 6),
+                property.USE_FIND_SCALE,
+                Math.Round(property.FIND_SCALE_MIN, 6),
+                Math.Round(property.FIND_SCALE_MAX, 6),
+                Math.Round(property.FIND_SCALE_STEP, 6));
+        }
+
+        public IEnumerable<double> CreateSearchAngles()
+        {
+            return CreateSearchAngles(property.FIND_ANGLE);
+        }
+
+        public IEnumerable<double> CreateSearchAngles(double angleStep)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!property.USE_FIND_ANGLE)
+            {
+                yield return 0D;
+                yield break;
+            }
+
+            foreach (double angle in CreateSearchAnglesInRange(property.FIND_ANGLE_MIN, property.FIND_ANGLE_MAX, angleStep))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return angle;
+            }
+        }
+
+        public IEnumerable<double> CreateSearchAnglesAround(double centerAngle, double radius, double angleStep)
+        {
+            double minAngle = Math.Max(Math.Min(property.FIND_ANGLE_MIN, property.FIND_ANGLE_MAX), centerAngle - radius);
+            double maxAngle = Math.Min(Math.Max(property.FIND_ANGLE_MIN, property.FIND_ANGLE_MAX), centerAngle + radius);
+            foreach (double angle in CreateSearchAnglesInRange(minAngle, maxAngle, angleStep))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return angle;
+            }
+        }
+
+        public IEnumerable<double> CreateSearchScales()
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!property.USE_FIND_SCALE)
+            {
+                yield return 1D;
+                yield break;
+            }
+
+            foreach (double scale in CreateSearchScalesInRange(
+                property.FIND_SCALE_MIN,
+                property.FIND_SCALE_MAX,
+                property.FIND_SCALE_STEP))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return scale;
+            }
+        }
+
+        private static IEnumerable<double> CreateSearchScalesInRange(double minScale, double maxScale, double scaleStep)
+        {
+            if (scaleStep <= 0D)
+            {
+                yield break;
+            }
+
+            if (minScale > maxScale)
+            {
+                double temp = minScale;
+                minScale = maxScale;
+                maxScale = temp;
+            }
+
+            HashSet<double> emitted = new HashSet<double>();
+            int start = (int)Math.Ceiling(minScale / scaleStep);
+            int end = (int)Math.Floor(maxScale / scaleStep);
+            for (int i = start; i <= end; i++)
+            {
+                double scale = NormalizeScale(i * scaleStep);
+                if (scale > 0D && emitted.Add(scale))
+                {
+                    yield return scale;
+                }
+            }
+
+            if (minScale <= 1D && maxScale >= 1D && emitted.Add(1D))
+            {
+                yield return 1D;
+            }
+        }
+
+        public bool ShouldUseCoarseToFineAngleSearch()
+        {
+            return property.USE_FIND_ANGLE
+                && property.USE_COARSE_TO_FINE_ANGLE_SEARCH
+                && property.COARSE_ANGLE_STEP > property.FIND_ANGLE;
+        }
+
+        private static IEnumerable<double> CreateSearchAnglesInRange(double minAngle, double maxAngle, double angleStep)
+        {
+            if (angleStep <= 0D)
+            {
+                yield break;
+            }
+
+            if (minAngle > maxAngle)
+            {
+                double temp = minAngle;
+                minAngle = maxAngle;
+                maxAngle = temp;
+            }
+
+            HashSet<double> emitted = new HashSet<double>();
+            int start = (int)Math.Ceiling(minAngle / angleStep);
+            int end = (int)Math.Floor(maxAngle / angleStep);
+            for (int i = start; i <= end; i++)
+            {
+                double angle = Math.Round(i * angleStep, 6);
+                if (emitted.Add(angle))
+                {
+                    yield return angle;
+                }
+            }
+
+            if (minAngle <= 0D && maxAngle >= 0D && emitted.Add(0D))
+            {
+                yield return 0D;
+            }
+        }
+
+        public static RotatedEdgeTemplateModel CreateRotatedModel(EdgeTemplateModel model, double angle)
+        {
+            double radians = angle * Math.PI / 180D;
+            double cos = Math.Cos(radians);
+            double sin = Math.Sin(radians);
+            List<RotatedTemplateEdgePoint> points = new List<RotatedTemplateEdgePoint>(model.Points.Count);
+
+            foreach (TemplateEdgePoint point in model.Points)
+            {
+                // OpenCV image coordinates use a downward Y axis. Match GetRotationMatrix2D
+                // angle semantics so EdgeBasedMatching reports the same sign as image matching.
+                int offsetX = (int)Math.Round(point.OffsetX * cos + point.OffsetY * sin);
+                int offsetY = (int)Math.Round(-point.OffsetX * sin + point.OffsetY * cos);
+                points.Add(new RotatedTemplateEdgePoint
+                {
+                    OffsetX = offsetX,
+                    OffsetY = offsetY,
+                    UnitDx = point.UnitDx * cos + point.UnitDy * sin,
+                    UnitDy = -point.UnitDx * sin + point.UnitDy * cos
+                });
+            }
+
+            int minOffsetX = points.Count == 0 ? 0 : points.Min(point => point.OffsetX);
+            int maxOffsetX = points.Count == 0 ? 0 : points.Max(point => point.OffsetX);
+            int minOffsetY = points.Count == 0 ? 0 : points.Min(point => point.OffsetY);
+            int maxOffsetY = points.Count == 0 ? 0 : points.Max(point => point.OffsetY);
+            RectangleF localBounds = CreateRotatedTemplateBounds(model, cos, sin);
+
+            double templateCenterOffsetX = ((model.Width / 2D) - model.Center.X) * cos + ((model.Height / 2D) - model.Center.Y) * sin;
+            double templateCenterOffsetY = -((model.Width / 2D) - model.Center.X) * sin + ((model.Height / 2D) - model.Center.Y) * cos;
+
+            return new RotatedEdgeTemplateModel(
+                model.Width,
+                model.Height,
+                Math.Round(angle, 6),
+                points,
+                minOffsetX,
+                maxOffsetX,
+                minOffsetY,
+                maxOffsetY,
+                localBounds,
+                templateCenterOffsetX,
+                templateCenterOffsetY,
+                model.Scale);
+        }
+
+        private static RectangleF CreateRotatedTemplateBounds(EdgeTemplateModel model, double cos, double sin)
+        {
+            Point2d[] corners =
+            {
+            new Point2d(-model.Center.X, -model.Center.Y),
+            new Point2d(model.Width - model.Center.X, -model.Center.Y),
+            new Point2d(model.Width - model.Center.X, model.Height - model.Center.Y),
+            new Point2d(-model.Center.X, model.Height - model.Center.Y)
+        };
+
+            double minX = double.MaxValue;
+            double minY = double.MaxValue;
+            double maxX = double.MinValue;
+            double maxY = double.MinValue;
+            foreach (Point2d corner in corners)
+            {
+                double x = corner.X * cos + corner.Y * sin;
+                double y = -corner.X * sin + corner.Y * cos;
+                minX = Math.Min(minX, x);
+                minY = Math.Min(minY, y);
+                maxX = Math.Max(maxX, x);
+                maxY = Math.Max(maxY, y);
+            }
+
+            return new RectangleF(
+                (float)minX,
+                (float)minY,
+                (float)(maxX - minX),
+                (float)(maxY - minY));
+        }
+
+    }
+
+        private TemplateModelCache GetTemplateModelCache()
+        {
+            return modelStore.GetTemplateModelCache();
+        }
+
+        private void ClearTemplateModelCache()
+        {
+            modelStore.Clear();
+        }
+
+        private Mat GetTemplateForRun()
+        {
+            return modelStore.GetTemplateForRun();
+        }
+
+        private Mat CreatePreparedGrayImage(Mat source) => CreatePreparedGrayImage(source, CurrentCancellationToken);
+
+        private Mat CreatePreparedGrayImage(Mat source, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Mat image = source.Clone();
+            try
+            {
+                ApplyCommonPreprocessing(image, property);
+                cancellationToken.ThrowIfCancellationRequested();
+                return image;
+            }
+            catch
+            {
+                image.Dispose();
+                throw;
+            }
+        }
+
+        private sealed class EdgeTemplateModelStore : IDisposable
+    {
+        private readonly EdgeBasedTemplateMatchingTool owner;
+        private Mat originalTemplate = new Mat();
+        private TemplateModelCache templateModelCache;
+        private long templateRevision;
+
+        public EdgeTemplateModelStore(EdgeBasedTemplateMatchingTool owner)
+        {
+            this.owner = owner;
+        }
+
+        private IOpenCVPropertyEdgeBasedTemplateMatching property => owner.property;
+
+        private CancellationToken cancellationToken => owner.CurrentCancellationToken;
+
+        public TemplateModelCache Current => templateModelCache;
+
+        public void SetTemplate(Mat image)
+        {
+            Clear();
+            originalTemplate?.Dispose();
+            originalTemplate = OpenCvHelper.IsImageEmpty(image) ? new Mat() : image.Clone();
+            templateRevision++;
+        }
+
+        public Mat GetTemplateForRun()
+        {
+            return OpenCvHelper.IsImageEmpty(originalTemplate) ? owner.imageTemplate : originalTemplate;
+        }
+
+        public TemplateModelCache GetTemplateModelCache() => GetTemplateModelCache(cancellationToken);
+
+        public TemplateModelCache GetTemplateModelCache(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Mat template = GetTemplateForRun();
+            string key = CreateTemplateModelCacheKey(template, templateRevision);
+            if (templateModelCache != null && string.Equals(templateModelCache.Key, key, StringComparison.Ordinal))
+            {
+                return templateModelCache;
+            }
+
+            Clear();
+            Mat preparedTemplate = owner.CreatePreparedGrayImage(template, cancellationToken);
+            try
+            {
+                EdgeTemplateModel model = CreateTemplateModel(preparedTemplate, 1D, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                templateModelCache = new TemplateModelCache(key, preparedTemplate, model, CreateTemplateModel);
+                preparedTemplate = null;
+                return templateModelCache;
+            }
+            finally
+            {
+                preparedTemplate?.Dispose();
+            }
+        }
+
+        public void Clear()
+        {
+            templateModelCache?.Dispose();
+            templateModelCache = null;
+        }
+
+        private string CreateTemplateModelCacheKey(Mat template, long revision)
+        {
+            if (OpenCvHelper.IsImageEmpty(template)) return "empty";
+            string path = property?.PATTERN_PATH ?? string.Empty;
+            long fileTicks = 0L;
+            if (!string.IsNullOrWhiteSpace(path) && System.IO.File.Exists(path))
+                fileTicks = System.IO.File.GetLastWriteTimeUtc(path).Ticks;
+            return string.Format(CultureInfo.InvariantCulture, "Tpl:{0}:{1}:{2}:{3}:{4}|Path:{5}:{6}|{7}",
+                template.Width, template.Height, template.Type(), template.Data.ToInt64(), revision, path, fileTicks, CreateLearningParameters());
+        }
+
+        public string CreateLearningParameters()
+        {
+            return string.Format(CultureInfo.InvariantCulture,
+                "Prep:{0}:{1}:{2:R}:{3}:{4}:{5:R}:{6}:{7}:{8}:{9}|Edge:{10}:{11}:{12}:{13}:{14}:{15}:{16}:{17:R}",
+                property.USE_THRESHOLD, property.THRESHOLD_TYPES, property.THRESHOLD,
+                property.USE_ADAPTIVE_THRESHOLD, property.ADAPTIVE_THRESHOLD_TYPES, property.ADAPTIVE_THRESHOLD,
+                property.ADAPTIVE_THRESHOLD_ALGORITHM, property.BlockSize, property.Weight, property.USE_BITWISENOT,
+                property.CANNY_LOW, property.CANNY_HIGH, property.CANNY_APERTURE_SIZE, property.USE_L2_GRADIENT,
+                property.CONTOUR_RETRIEVAL_MODE, property.CONTOUR_APPROXIMATION_MODE, property.MAX_TEMPLATE_POINTS, property.MIN_GRADIENT_MAGNITUDE);
+        }
+
+        public void Restore(EdgeTemplateModelArtifact artifact, CancellationToken cancellationToken)
+        {
+            Mat original = null, prepared = null, display = null;
+            TemplateModelCache cache = null;
+            try
+            {
+                original = RestoreRaster(artifact.Width, artifact.Height, artifact.SourceChannels, artifact.SourceBytes, cancellationToken);
+                prepared = RestoreRaster(artifact.Width, artifact.Height, 1, artifact.PreparedBytes, cancellationToken);
+                display = original.Clone();
+                List<TemplateEdgePoint> points = new List<TemplateEdgePoint>(artifact.Points.Count);
+                foreach (EdgeTemplateModelPoint point in artifact.Points)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    points.Add(new TemplateEdgePoint
+                    {
+                        X = point.X, Y = point.Y, UnitDx = point.UnitDx, UnitDy = point.UnitDy, InvMagnitude = point.InverseMagnitude,
+                        OffsetX = (int)Math.Round(point.X - artifact.CenterX), OffsetY = (int)Math.Round(point.Y - artifact.CenterY)
+                    });
+                }
+                EdgeTemplateModel model = new EdgeTemplateModel(artifact.Width, artifact.Height,
+                    new Point2d(artifact.CenterX, artifact.CenterY), points, artifact.RawPointCount, 1D);
+                cache = new TemplateModelCache(CreateTemplateModelCacheKey(original, templateRevision + 1), prepared, model, CreateTemplateModel);
+                prepared = null;
+                cancellationToken.ThrowIfCancellationRequested();
+                Clear();
+                originalTemplate?.Dispose();
+                owner.imageTemplate?.Dispose();
+                originalTemplate = original;
+                owner.imageTemplate = display;
+                templateModelCache = cache;
+                templateRevision++;
+                original = null;
+                display = null;
+                cache = null;
+            }
+            finally
+            {
+                cache?.Dispose();
+                original?.Dispose();
+                prepared?.Dispose();
+                display?.Dispose();
+            }
+        }
+
+        public EdgeTemplateModel CreateModel(Mat template)
+        {
+            return CreateTemplateModel(template, 1D);
+        }
+
+        private EdgeTemplateModel CreateTemplateModel(Mat template, double scale) => CreateTemplateModel(template, scale, cancellationToken);
+
+        private EdgeTemplateModel CreateTemplateModel(Mat template, double scale, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using (Mat edges = new Mat())
+            using (GradientImage gradients = GradientImage.Create(
+                template,
+                property.MIN_GRADIENT_MAGNITUDE,
+                cancellationToken,
+                retainMagnitude: true))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Cv2.Canny(
+                    template,
+                    edges,
+                    property.CANNY_LOW,
+                    property.CANNY_HIGH,
+                    NormalizeCannyAperture(property.CANNY_APERTURE_SIZE),
+                    property.USE_L2_GRADIENT);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                Cv2.FindContours(
+                    edges,
+                    out OpenCvSharp.Point[][] contours,
+                    out _,
+                    property.CONTOUR_RETRIEVAL_MODE,
+                    property.CONTOUR_APPROXIMATION_MODE);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                List<TemplateEdgePoint> points = new List<TemplateEdgePoint>();
+                HashSet<long> seen = new HashSet<long>();
+                foreach (OpenCvSharp.Point[] contour in contours)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    foreach (OpenCvSharp.Point point in contour)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        long key = ((long)point.Y << 32) | (uint)point.X;
+                        if (!seen.Add(key))
+                        {
+                            continue;
+                        }
+
+                        double magnitude = gradients.GetMagnitude(point.X, point.Y);
+                        if (magnitude <= property.MIN_GRADIENT_MAGNITUDE)
+                        {
+                            continue;
+                        }
+
+                        points.Add(new TemplateEdgePoint
+                        {
+                            X = point.X,
+                            Y = point.Y,
+                            UnitDx = gradients.GetUnitDx(point.X, point.Y),
+                            UnitDy = gradients.GetUnitDy(point.X, point.Y),
+                            InvMagnitude = 1d / magnitude
+                        });
+                    }
+                }
+
+                int rawPointCount = points.Count;
+                points = Downsample(points, property.MAX_TEMPLATE_POINTS);
+                if (points.Count == 0)
+                {
+                    return new EdgeTemplateModel(template.Width, template.Height, new Point2d(), points, rawPointCount, scale);
+                }
+
+                Point2d center = new Point2d(points.Average(point => point.X), points.Average(point => point.Y));
+                foreach (TemplateEdgePoint point in points)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    point.OffsetX = (int)Math.Round(point.X - center.X);
+                    point.OffsetY = (int)Math.Round(point.Y - center.Y);
+                }
+
+                return new EdgeTemplateModel(template.Width, template.Height, center, points, rawPointCount, scale);
+            }
+        }
+
+        public void Dispose()
+        {
+            Clear();
+            originalTemplate?.Dispose();
+            originalTemplate = null;
+        }
+    }
+
+        private Rect NormalizeRoi(Rect roi)
+        {
+            return roi.Width == 0 || roi.Height == 0
+                ? new Rect(0, 0, imageSource.Width, imageSource.Height)
+                : roi;
+        }
+
+        private MatchingResult CreateResult(MatchCandidate candidate, EdgeTemplateModel model, Rect roi, bool applyRoiOffset)
+        {
+            double templateCenterX = candidate.TemplateCenter.X;
+            double templateCenterY = candidate.TemplateCenter.Y;
+            if (applyRoiOffset)
+            {
+                templateCenterX += roi.X;
+                templateCenterY += roi.Y;
+            }
+
+            Rect2f bounding = new Rect2f(
+                (float)(templateCenterX - (candidate.Width / 2D)),
+                (float)(templateCenterY - (candidate.Height / 2D)),
+                candidate.Width,
+                candidate.Height);
+            Point2f center = new Point2f((float)templateCenterX, (float)templateCenterY);
+            double edgeScore = Math.Round(candidate.Score * 100D, 3);
+            MatchingResult result = new MatchingResult(
+                0,
+                edgeScore,
+                center,
+                bounding,
+                candidate.Angle,
+                candidate.Scale)
+            {
+                EdgeScore = edgeScore,
+                ImageScore = double.IsNaN(candidate.ImageVerifyScore)
+                    ? double.NaN
+                    : Math.Round(candidate.ImageVerifyScore * 100D, 3),
+                FinalScore = Math.Round(GetUniqueMatchSelectionScore(candidate) * 100D, 3),
+                ScoreMargin = property.USE_UNIQUE_MATCH_VALIDATION
+                    ? Math.Round(candidateDiagnostics.UniqueMatchScoreMargin * 100D, 3)
+                    : double.NaN,
+                PolarityReversed = candidate.PolarityReversed
+            };
+            return result;
+        }
+
+        private static RectangleF CreateLocalBounds(int centerX, int centerY, RotatedEdgeTemplateModel model)
+        {
+            return new RectangleF(
+                centerX + model.LocalBounds.X,
+                centerY + model.LocalBounds.Y,
+                model.LocalBounds.Width,
+                model.LocalBounds.Height);
+        }
+
+        private bool IsDuplicate(MatchingResult result)
+        {
+            double threshold = Math.Max(4d, Math.Min(result.Bounding.Width, result.Bounding.Height) * 0.35d);
+            foreach (MatchingResult existing in results)
+            {
+                double dx = existing.Center.X - result.Center.X;
+                double dy = existing.Center.Y - result.Center.Y;
+                if (Math.Sqrt(dx * dx + dy * dy) < threshold)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsSuppressed(RectangleF bounds, List<RectangleF> suppressedBounds)
+        {
+            if (suppressedBounds == null || suppressedBounds.Count == 0)
+            {
+                return false;
+            }
+
+            PointF center = new PointF(bounds.X + bounds.Width / 2f, bounds.Y + bounds.Height / 2f);
+            return suppressedBounds.Any(rect => rect.Contains(center));
+        }
+
+        private static RectangleF CreateExpandedBounds(RectangleF bounds, float expansionRatio)
+        {
+            float expandX = bounds.Width * expansionRatio;
+            float expandY = bounds.Height * expansionRatio;
+            return new RectangleF(
+                bounds.X - expandX,
+                bounds.Y - expandY,
+                bounds.Width + expandX * 2,
+                bounds.Height + expandY * 2);
+        }
+
+        private bool TryUseHybridProposalFastPath(MatchCandidate imageProposal, int localMatchCount)
+        {
+            return hybridSearch.TryUseHybridProposalFastPath(imageProposal, localMatchCount);
+        }
+
+        private MatchCandidate CreateHybridImageProposalCandidate(
+            GradientImage gradients,
+            Mat source,
+            Mat template,
+            TemplateModelCache modelCache,
+            List<RectangleF> suppressedBounds)
+        {
+            return hybridSearch.CreateHybridImageProposalCandidate(
+                gradients,
+                source,
+                template,
+                modelCache,
+                suppressedBounds);
+        }
+
+        private MatchCandidate ApplyHybridVerification(
+            Mat source,
+            Mat template,
+            MatchCandidate fallback,
+            IEnumerable<MatchCandidate> candidateSeeds,
+            MatchCandidate imageProposal)
+        {
+            return hybridSearch.ApplyHybridVerification(source, template, fallback, candidateSeeds, imageProposal);
+        }
+
+        private bool ShouldUseHybridVerify()
+        {
+            return hybridSearch.ShouldUseHybridVerify();
+        }
+
+        private int GetCandidateSeedCapacity()
+        {
+            return hybridSearch.GetCandidateSeedCapacity();
+        }
+
+        private bool ShouldUseHybridSpatialSeeds()
+        {
+            return hybridSearch.ShouldUseHybridSpatialSeeds();
+        }
+
+        private sealed class EdgeHybridCandidateSearch
+    {
+        private readonly EdgeBasedTemplateMatchingTool owner;
+
+        public EdgeHybridCandidateSearch(EdgeBasedTemplateMatchingTool owner)
+        {
+            this.owner = owner;
+        }
+
+        private IOpenCVPropertyEdgeBasedTemplateMatching property => owner.property;
+
+        private CandidateDiagnostics candidateDiagnostics => owner.candidateDiagnostics;
+
+        private CancellationToken cancellationToken => owner.CurrentCancellationToken;
+
+        private double ScoreCandidate(GradientImage gradients, RotatedEdgeTemplateModel model, int centerX, int centerY)
+            => owner.ScoreCandidate(gradients, model, centerX, centerY);
+
+        private bool ShouldUseCoarseToFineAngleSearch() => owner.ShouldUseCoarseToFineAngleSearch();
+
+        private IEnumerable<double> CreateSearchAngles(double angleStep) => owner.CreateSearchAngles(angleStep);
+
+        private IEnumerable<double> CreateSearchAnglesAround(double centerAngle, double radius, double angleStep)
+            => owner.CreateSearchAnglesAround(centerAngle, radius, angleStep);
+
+        private long StartPhaseTiming() => owner.StartPhaseTiming();
+
+        private void StopPhaseTiming(string phaseName, long startTimestamp) => owner.StopPhaseTiming(phaseName, startTimestamp);
+
+        private void RecordCandidateAmbiguityDiagnostics(
+            IEnumerable<MatchCandidate> candidates,
+            MatchCandidate selected,
+            Mat template)
+            => owner.RecordCandidateAmbiguityDiagnostics(candidates, selected, template);
+
+        public bool TryUseHybridProposalFastPath(MatchCandidate imageProposal, int localMatchCount)
+        {
+            if (property.USE_UNIQUE_MATCH_VALIDATION
+                || !ShouldUseHybridVerify()
+                || localMatchCount != 1
+                || imageProposal == null
+                || double.IsNaN(imageProposal.ImageVerifyScore))
+            {
+                return false;
+            }
+
+            double requiredEdgeScore = Math.Max(property.SCORE_MIN, HybridProposalFastPathMinEdgeScore);
+            return imageProposal.ImageVerifyScore >= HybridProposalFastPathMinImageScore
+                && imageProposal.Score >= requiredEdgeScore;
+        }
+
+        public MatchCandidate CreateHybridImageProposalCandidate(
+            GradientImage gradients,
+            Mat source,
+            Mat template,
+            TemplateModelCache modelCache,
+            List<RectangleF> suppressedBounds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!ShouldUseHybridVerify()
+                || property.USE_FIND_SCALE
+                || OpenCvHelper.IsImageEmpty(source)
+                || OpenCvHelper.IsImageEmpty(template)
+                || template.Width > source.Width
+                || template.Height > source.Height)
+            {
+                return null;
+            }
+
+            if (property.USE_FIND_ANGLE)
+            {
+                return CreateHybridAngleImageProposalCandidate(
+                    gradients,
+                    source,
+                    template,
+                    modelCache,
+                    suppressedBounds);
+            }
+
+            EdgeTemplateModel baseModel = modelCache.Model;
+            using (Mat result = new Mat())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Cv2.MatchTemplate(source, template, result, TemplateMatchModes.CCoeffNormed);
+                cancellationToken.ThrowIfCancellationRequested();
+                Cv2.MinMaxLoc(result, out _, out double maxValue, out _, out OpenCvSharp.Point maxLocation);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                RotatedEdgeTemplateModel model = CreateRotatedModel(baseModel, 0D);
+                int centerX = (int)Math.Round(maxLocation.X + baseModel.Center.X);
+                int centerY = (int)Math.Round(maxLocation.Y + baseModel.Center.Y);
+                RectangleF bounds = CreateLocalBounds(centerX, centerY, model);
+                if (IsSuppressed(bounds, suppressedBounds))
+                {
+                    return null;
+                }
+
+                double score = ScoreCandidate(gradients, model, centerX, centerY);
+                MatchCandidate candidate = CreateMatchCandidate(model, centerX, centerY, bounds, score);
+                candidate.ImageVerifyScore = NormalizeTemplateMatchScore(maxValue);
+                return candidate;
+            }
+        }
+
+        private MatchCandidate CreateHybridAngleImageProposalCandidate(
+            GradientImage gradients,
+            Mat source,
+            Mat template,
+            TemplateModelCache modelCache,
+            List<RectangleF> suppressedBounds)
+        {
+            MatchCandidate coarseBest = CreateBestHybridImageProposalFromAngles(
+                gradients,
+                source,
+                template,
+                modelCache,
+                ShouldUseCoarseToFineAngleSearch() ? property.COARSE_ANGLE_STEP : property.FIND_ANGLE,
+                suppressedBounds);
+            if (coarseBest == null || !ShouldUseCoarseToFineAngleSearch())
+            {
+                return coarseBest;
+            }
+
+            double refineRadius = Math.Max(property.FIND_ANGLE, property.COARSE_ANGLE_STEP / 2D);
+            return CreateBestHybridImageProposalFromAngles(
+                gradients,
+                source,
+                template,
+                modelCache,
+                CreateSearchAnglesAround(coarseBest.Angle, refineRadius, property.FIND_ANGLE),
+                suppressedBounds) ?? coarseBest;
+        }
+
+        private MatchCandidate CreateBestHybridImageProposalFromAngles(
+            GradientImage gradients,
+            Mat source,
+            Mat template,
+            TemplateModelCache modelCache,
+            double angleStep,
+            List<RectangleF> suppressedBounds)
+        {
+            return CreateBestHybridImageProposalFromAngles(
+                gradients,
+                source,
+                template,
+                modelCache,
+                CreateSearchAngles(angleStep),
+                suppressedBounds);
+        }
+
+        private MatchCandidate CreateBestHybridImageProposalFromAngles(
+            GradientImage gradients,
+            Mat source,
+            Mat template,
+            TemplateModelCache modelCache,
+            IEnumerable<double> angles,
+            List<RectangleF> suppressedBounds)
+        {
+            MatchCandidate best = null;
+            double bestImageScore = double.MinValue;
+            bool useScaledProposal = TryGetHybridProposalScale(source, template, out double proposalScale);
+            double[] angleArray = (angles ?? Enumerable.Empty<double>()).ToArray();
+            using (Mat scaledSource = useScaledProposal ? new Mat() : null)
+            {
+                // The source image is the same for every angle in this proposal batch.
+                // Keep this resize outside the angle loop; only rotated templates change per angle.
+                if (useScaledProposal)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    long scaleSourceStart = StartPhaseTiming();
+                    Cv2.Resize(source, scaledSource, new OpenCvSharp.Size(), proposalScale, proposalScale, InterpolationFlags.Area);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    StopPhaseTiming("HybridProposal.ScaleSource", scaleSourceStart);
+                }
+
+                if (ShouldUseParallelHybridProposal(angleArray.Length))
+                {
+                    object sync = new object();
+                    Parallel.ForEach(angleArray, new ParallelOptions { CancellationToken = cancellationToken }, angle =>
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        MatchCandidate candidate = CreateHybridImageProposalCandidateForAngle(
+                            gradients,
+                            source,
+                            template,
+                            modelCache,
+                            angle,
+                            useScaledProposal ? scaledSource : null,
+                            proposalScale,
+                            suppressedBounds,
+                            out double imageScore);
+                        if (candidate == null)
+                        {
+                            return;
+                        }
+
+                        lock (sync)
+                        {
+                            if (best == null
+                                || imageScore > bestImageScore
+                                || (Math.Abs(imageScore - bestImageScore) <= 0.0000001D && IsBetterCandidate(candidate, best)))
+                            {
+                                best = candidate;
+                                bestImageScore = imageScore;
+                            }
+                        }
+                    });
+                }
+                else
+                {
+                    foreach (double angle in angleArray)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        MatchCandidate candidate = CreateHybridImageProposalCandidateForAngle(
+                            gradients,
+                            source,
+                            template,
+                            modelCache,
+                            angle,
+                            useScaledProposal ? scaledSource : null,
+                            proposalScale,
+                            suppressedBounds,
+                            out double imageScore);
+                        if (candidate == null)
+                        {
+                            continue;
+                        }
+
+                        if (best == null
+                            || imageScore > bestImageScore
+                            || (Math.Abs(imageScore - bestImageScore) <= 0.0000001D && IsBetterCandidate(candidate, best)))
+                        {
+                            best = candidate;
+                            bestImageScore = imageScore;
+                        }
+                    }
+                }
+            }
+
+            return best;
+        }
+
+        private static bool ShouldUseParallelHybridProposal(int angleCount)
+        {
+            return Environment.ProcessorCount > 1 && angleCount >= 4;
+        }
+
+        private MatchCandidate CreateHybridImageProposalCandidateForAngle(
+            GradientImage gradients,
+            Mat source,
+            Mat template,
+            TemplateModelCache modelCache,
+            double angle,
+            Mat scaledSource,
+            double proposalScale,
+            List<RectangleF> suppressedBounds,
+            out double imageScore)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            imageScore = double.NaN;
+            long rotateStart = StartPhaseTiming();
+            using (Mat verifyTemplate = CreateHybridVerifyTemplate(template, angle))
+            {
+                StopPhaseTiming("HybridProposal.RotateTemplate", rotateStart);
+                if (verifyTemplate.Width > source.Width || verifyTemplate.Height > source.Height)
+                {
+                    return null;
+                }
+
+                if (TryCreateScaledHybridImageProposalCandidateForAngle(
+                    gradients,
+                    source,
+                    verifyTemplate,
+                    modelCache,
+                    angle,
+                    scaledSource,
+                    proposalScale,
+                    suppressedBounds,
+                    out MatchCandidate scaledCandidate,
+                    out double scaledImageScore))
+                {
+                    imageScore = scaledImageScore;
+                    return scaledCandidate;
+                }
+
+                return CreateFullResolutionHybridImageProposalCandidateForAngle(
+                    gradients,
+                    source,
+                    verifyTemplate,
+                    modelCache,
+                    angle,
+                    suppressedBounds,
+                    out imageScore);
+            }
+        }
+
+        private MatchCandidate CreateFullResolutionHybridImageProposalCandidateForAngle(
+            GradientImage gradients,
+            Mat source,
+            Mat verifyTemplate,
+            TemplateModelCache modelCache,
+            double angle,
+            List<RectangleF> suppressedBounds,
+            out double imageScore)
+        {
+            imageScore = double.NaN;
+            using (Mat result = new Mat())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                long fullMatchStart = StartPhaseTiming();
+                Cv2.MatchTemplate(source, verifyTemplate, result, TemplateMatchModes.CCoeffNormed);
+                cancellationToken.ThrowIfCancellationRequested();
+                Cv2.MinMaxLoc(result, out _, out double maxValue, out _, out OpenCvSharp.Point maxLocation);
+                cancellationToken.ThrowIfCancellationRequested();
+                StopPhaseTiming("HybridProposal.FullMatch", fullMatchStart);
+                imageScore = NormalizeTemplateMatchScore(maxValue);
+                return CreateHybridImageProposalCandidateFromLocation(
+                    gradients,
+                    modelCache,
+                    angle,
+                    verifyTemplate.Width,
+                    verifyTemplate.Height,
+                    maxLocation,
+                    imageScore,
+                    suppressedBounds);
+            }
+        }
+
+        private bool TryCreateScaledHybridImageProposalCandidateForAngle(
+            GradientImage gradients,
+            Mat source,
+            Mat verifyTemplate,
+            TemplateModelCache modelCache,
+            double angle,
+            Mat scaledSource,
+            double scale,
+            List<RectangleF> suppressedBounds,
+            out MatchCandidate candidate,
+            out double imageScore)
+        {
+            candidate = null;
+            imageScore = double.NaN;
+            if (OpenCvHelper.IsImageEmpty(scaledSource) || scale <= 0D)
+            {
+                return false;
+            }
+
+            using (Mat scaledTemplate = new Mat())
+            using (Mat result = new Mat())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                long scaleTemplateStart = StartPhaseTiming();
+                Cv2.Resize(verifyTemplate, scaledTemplate, new OpenCvSharp.Size(), scale, scale, InterpolationFlags.Area);
+                cancellationToken.ThrowIfCancellationRequested();
+                StopPhaseTiming("HybridProposal.ScaleTemplate", scaleTemplateStart);
+                if (scaledTemplate.Width > scaledSource.Width || scaledTemplate.Height > scaledSource.Height)
+                {
+                    return false;
+                }
+
+                long scaledMatchStart = StartPhaseTiming();
+                Cv2.MatchTemplate(scaledSource, scaledTemplate, result, TemplateMatchModes.CCoeffNormed);
+                cancellationToken.ThrowIfCancellationRequested();
+                List<TemplateMatchLocation> locations = FindTopTemplateMatchLocations(
+                    result,
+                    HybridProposalScaledTopK,
+                    GetHybridProposalSuppressionRadius(scaledTemplate));
+                StopPhaseTiming("HybridProposal.ScaledMatch", scaledMatchStart);
+
+                MatchCandidate best = null;
+                double bestImageScore = double.MinValue;
+                foreach (TemplateMatchLocation location in locations)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    double predictedX = location.Location.X / scale;
+                    double predictedY = location.Location.Y / scale;
+                    if (!TryRefineHybridTemplateLocation(
+                        source,
+                        verifyTemplate,
+                        predictedX,
+                        predictedY,
+                        scale,
+                        out OpenCvSharp.Point refinedLocation,
+                        out double refinedImageScore))
+                    {
+                        continue;
+                    }
+
+                    MatchCandidate refinedCandidate = CreateHybridImageProposalCandidateFromLocation(
+                        gradients,
+                        modelCache,
+                        angle,
+                        verifyTemplate.Width,
+                        verifyTemplate.Height,
+                        refinedLocation,
+                        refinedImageScore,
+                        suppressedBounds);
+                    if (refinedCandidate == null)
+                    {
+                        continue;
+                    }
+
+                    if (best == null
+                        || refinedImageScore > bestImageScore
+                        || (Math.Abs(refinedImageScore - bestImageScore) <= 0.0000001D
+                            && IsBetterCandidate(refinedCandidate, best)))
+                    {
+                        best = refinedCandidate;
+                        bestImageScore = refinedImageScore;
+                    }
+                }
+
+                if (best == null)
+                {
+                    return false;
+                }
+
+                candidate = best;
+                imageScore = bestImageScore;
+                return true;
+            }
+        }
+
+        private MatchCandidate CreateHybridImageProposalCandidateFromLocation(
+            GradientImage gradients,
+            TemplateModelCache modelCache,
+            double angle,
+            int templateWidth,
+            int templateHeight,
+            OpenCvSharp.Point topLeft,
+            double imageScore,
+            List<RectangleF> suppressedBounds)
+        {
+            RotatedEdgeTemplateModel model = modelCache.GetRotatedModel(angle);
+            double templateCenterX = topLeft.X + (templateWidth / 2D);
+            double templateCenterY = topLeft.Y + (templateHeight / 2D);
+            int centerX = (int)Math.Round(templateCenterX - model.TemplateCenterOffsetX);
+            int centerY = (int)Math.Round(templateCenterY - model.TemplateCenterOffsetY);
+            RectangleF bounds = CreateLocalBounds(centerX, centerY, model);
+            if (IsSuppressed(bounds, suppressedBounds))
+            {
+                return null;
+            }
+
+            if (!IsCandidateInsideImage(gradients, model, centerX, centerY))
+            {
+                return null;
+            }
+
+            double edgeScore = ScoreCandidate(gradients, model, centerX, centerY);
+            MatchCandidate candidate = CreateMatchCandidate(model, centerX, centerY, bounds, edgeScore);
+            candidate.ImageVerifyScore = imageScore;
+            return candidate;
+        }
+
+        private static bool IsCandidateInsideImage(
+            GradientImage gradients,
+            RotatedEdgeTemplateModel model,
+            int centerX,
+            int centerY)
+        {
+            return centerX + model.MinOffsetX >= 0
+                && centerY + model.MinOffsetY >= 0
+                && centerX + model.MaxOffsetX < gradients.Width
+                && centerY + model.MaxOffsetY < gradients.Height;
+        }
+
+        private static bool TryGetHybridProposalScale(Mat source, Mat template, out double scale)
+        {
+            scale = 1D;
+            int sourcePixels = source.Width * source.Height;
+            int minTemplateSize = Math.Min(template.Width, template.Height);
+            if (sourcePixels < HybridProposalDownscaleSourcePixels
+                || minTemplateSize < HybridProposalMinScaledTemplateSize)
+            {
+                return false;
+            }
+
+            double targetScale = Math.Sqrt((double)HybridProposalDownscaleTargetPixels / sourcePixels);
+            double templateScale = (double)HybridProposalMinScaledTemplateSize / minTemplateSize;
+            scale = Clamp(Math.Max(targetScale, templateScale), 0.25D, 0.75D);
+            int scaledTemplateWidth = Math.Max(1, (int)Math.Round(template.Width * scale));
+            int scaledTemplateHeight = Math.Max(1, (int)Math.Round(template.Height * scale));
+            return scale < 0.95D
+                && scaledTemplateWidth >= HybridProposalMinScaledTemplateSize
+                && scaledTemplateHeight >= HybridProposalMinScaledTemplateSize;
+        }
+
+        private List<TemplateMatchLocation> FindTopTemplateMatchLocations(
+            Mat result,
+            int count,
+            int suppressionRadius)
+        {
+            List<TemplateMatchLocation> locations = new List<TemplateMatchLocation>(Math.Max(1, count));
+            using (Mat work = result.Clone())
+            {
+                int limit = Math.Max(1, count);
+                for (int i = 0; i < limit; i++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Cv2.MinMaxLoc(work, out _, out double maxValue, out _, out OpenCvSharp.Point maxLocation);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    locations.Add(new TemplateMatchLocation(maxLocation, maxValue));
+
+                    int left = Math.Max(0, maxLocation.X - suppressionRadius);
+                    int top = Math.Max(0, maxLocation.Y - suppressionRadius);
+                    int right = Math.Min(work.Width - 1, maxLocation.X + suppressionRadius);
+                    int bottom = Math.Min(work.Height - 1, maxLocation.Y + suppressionRadius);
+                    if (right < left || bottom < top)
+                    {
+                        continue;
+                    }
+
+                    using (Mat suppressed = new Mat(work, new Rect(left, top, right - left + 1, bottom - top + 1)))
+                    {
+                        suppressed.SetTo(new Scalar(-1D));
+                    }
+                }
+            }
+
+            return locations;
+        }
+
+        private static int GetHybridProposalSuppressionRadius(Mat scaledTemplate)
+        {
+            return Math.Max(4, Math.Min(scaledTemplate.Width, scaledTemplate.Height) / 3);
+        }
+
+        private bool TryRefineHybridTemplateLocation(
+            Mat source,
+            Mat verifyTemplate,
+            double predictedX,
+            double predictedY,
+            double scale,
+            out OpenCvSharp.Point location,
+            out double score)
+        {
+            location = new OpenCvSharp.Point();
+            score = double.NaN;
+            int maxTopLeftX = source.Width - verifyTemplate.Width;
+            int maxTopLeftY = source.Height - verifyTemplate.Height;
+            if (maxTopLeftX < 0 || maxTopLeftY < 0)
+            {
+                return false;
+            }
+
+            int radius = (int)Math.Ceiling(Math.Max(HybridProposalMinRefineRadius, 2D / scale));
+            int centerX = ClampInt((int)Math.Round(predictedX), 0, maxTopLeftX);
+            int centerY = ClampInt((int)Math.Round(predictedY), 0, maxTopLeftY);
+            int minX = ClampInt(centerX - radius, 0, maxTopLeftX);
+            int maxX = ClampInt(centerX + radius, 0, maxTopLeftX);
+            int minY = ClampInt(centerY - radius, 0, maxTopLeftY);
+            int maxY = ClampInt(centerY + radius, 0, maxTopLeftY);
+            if (maxX < minX || maxY < minY)
+            {
+                return false;
+            }
+
+            Rect patchRect = new Rect(
+                minX,
+                minY,
+                (maxX - minX) + verifyTemplate.Width,
+                (maxY - minY) + verifyTemplate.Height);
+            using (Mat sourcePatch = new Mat(source, patchRect))
+            using (Mat result = new Mat())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                long refineStart = StartPhaseTiming();
+                Cv2.MatchTemplate(sourcePatch, verifyTemplate, result, TemplateMatchModes.CCoeffNormed);
+                cancellationToken.ThrowIfCancellationRequested();
+                Cv2.MinMaxLoc(result, out _, out double maxValue, out _, out OpenCvSharp.Point localLocation);
+                cancellationToken.ThrowIfCancellationRequested();
+                StopPhaseTiming("HybridProposal.RefineMatch", refineStart);
+                location = new OpenCvSharp.Point(patchRect.X + localLocation.X, patchRect.Y + localLocation.Y);
+                score = NormalizeTemplateMatchScore(maxValue);
+                return true;
+            }
+        }
+
+        private static double NormalizeTemplateMatchScore(double value)
+        {
+            return Clamp((value + 1D) / 2D, 0D, 1D);
+        }
+
+        private static int ClampInt(int value, int min, int max)
+        {
+            if (value < min)
+            {
+                return min;
+            }
+
+            if (value > max)
+            {
+                return max;
+            }
+
+            return value;
+        }
+
+        public MatchCandidate ApplyHybridVerification(
+            Mat source,
+            Mat template,
+            MatchCandidate fallback,
+            IEnumerable<MatchCandidate> candidateSeeds,
+            MatchCandidate imageProposal)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!ShouldUseHybridVerify() || fallback == null)
+            {
+                return fallback;
+            }
+
+            int topN = Math.Max(1, property.HYBRID_VERIFY_TOP_N);
+            int verifyCapacity = Math.Max(topN, GetCandidateSeedCapacity());
+            List<MatchCandidate> candidates = new List<MatchCandidate>(verifyCapacity + 1);
+            TrackCandidateSeed(candidates, fallback, verifyCapacity);
+            MergeCandidateSeeds(candidates, candidateSeeds, verifyCapacity);
+            AddCandidateSeed(candidates, imageProposal);
+            bool containsImageProposal = imageProposal != null
+                && candidates.Any(candidate => IsSameCandidate(candidate, imageProposal));
+
+            int verifiedCount = VerifyCandidateScores(source, template, candidates);
+            MatchCandidate best = fallback;
+            foreach (MatchCandidate candidate in candidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (IsBetterHybridCandidate(candidate, best)) best = candidate;
+            }
+            RecordHybridVerificationDiagnostics(candidates.Count, verifiedCount, containsImageProposal, imageProposal, fallback, best);
+            RecordCandidateAmbiguityDiagnostics(candidates, best, template);
+            return best;
+        }
+
+        public int VerifyCandidateScores(Mat source, Mat template, List<MatchCandidate> candidates)
+        {
+            double imageWeight = Clamp(property.HYBRID_VERIFY_IMAGE_WEIGHT, 0D, 1D);
+            double edgeWeight = 1D - imageWeight;
+            List<HybridVerificationScore> verifiedScores = new List<HybridVerificationScore>(candidates.Count);
+            double bestImageScore = double.MinValue;
+            MatchCandidate bestImageCandidate = null;
+            foreach (MatchCandidate candidate in candidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                double imageScore = candidate.ImageVerifyScore;
+                if (double.IsNaN(imageScore)
+                    && !TryComputeHybridImageScore(source, template, candidate, out imageScore))
+                {
+                    continue;
+                }
+
+                verifiedScores.Add(new HybridVerificationScore(candidate, imageScore));
+                if (imageScore > bestImageScore)
+                {
+                    bestImageScore = imageScore;
+                    bestImageCandidate = candidate;
+                }
+            }
+
+            foreach (HybridVerificationScore verifiedScore in verifiedScores)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                MatchCandidate candidate = verifiedScore.Candidate;
+                double imageScore = verifiedScore.ImageScore;
+                double descriptorScore = double.NaN;
+                double finalVerificationScore = imageScore;
+
+                // Edge-map descriptors are only a near-tie resolver. They must not let a weak
+                // image proposal beat the clearly better image location in repeated patterns.
+                if (imageScore >= bestImageScore - HybridDescriptorImageTieMargin
+                    && IsNearHybridBestImageCandidate(candidate, bestImageCandidate, template)
+                    && TryComputeHybridEdgeDescriptorScore(source, template, candidate, out descriptorScore))
+                {
+                    finalVerificationScore = BlendHybridVerificationScore(imageScore, descriptorScore);
+                }
+
+                candidate.ImageVerifyScore = imageScore;
+                candidate.DescriptorVerifyScore = descriptorScore;
+                candidate.HybridScore = (candidate.Score * edgeWeight) + (finalVerificationScore * imageWeight);
+            }
+            return verifiedScores.Count;
+        }
+
+        private void RecordHybridVerificationDiagnostics(
+            int candidateCount,
+            int verifiedCount,
+            bool containsImageProposal,
+            MatchCandidate imageProposal,
+            MatchCandidate fallback,
+            MatchCandidate selected)
+        {
+            if (!ShouldUseHybridVerify())
+            {
+                return;
+            }
+
+            candidateDiagnostics.HybridCandidateCount += Math.Max(0, candidateCount);
+            candidateDiagnostics.HybridVerifiedCount += Math.Max(0, verifiedCount);
+            if (containsImageProposal)
+            {
+                candidateDiagnostics.ImageProposalInVerificationCount++;
+            }
+
+            if (IsSameCandidate(selected, imageProposal))
+            {
+                candidateDiagnostics.ImageProposalSelectedCount++;
+            }
+
+            if (IsSameCandidate(selected, fallback))
+            {
+                candidateDiagnostics.FallbackSelectedCount++;
+            }
+        }
+
+        private static void AddCandidateSeed(List<MatchCandidate> seeds, MatchCandidate candidate)
+        {
+            if (seeds == null || candidate == null)
+            {
+                return;
+            }
+
+            foreach (MatchCandidate seed in seeds)
+            {
+                if (IsSameCandidate(seed, candidate))
+                {
+                    return;
+                }
+            }
+
+            seeds.Add(candidate);
+            seeds.Sort((left, right) => right.Score.CompareTo(left.Score));
+        }
+
+        private bool TryComputeHybridImageScore(
+            Mat source,
+            Mat template,
+            MatchCandidate candidate,
+            out double imageScore)
+        {
+            imageScore = 0D;
+            if (OpenCvHelper.IsImageEmpty(source)
+                || OpenCvHelper.IsImageEmpty(template)
+                || candidate == null)
+            {
+                return false;
+            }
+
+            using (Mat verifyTemplate = CreateHybridVerifyTemplate(template, candidate.Angle, candidate.Scale))
+            using (Mat result = new Mat())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Rect patchRect = CreateTemplatePatchRect(source, verifyTemplate, candidate);
+                if (patchRect.Width <= 0 || patchRect.Height <= 0)
+                {
+                    return false;
+                }
+
+                using (Mat sourcePatch = new Mat(source, patchRect))
+                {
+                    long imageScoreStart = StartPhaseTiming();
+                    Cv2.MatchTemplate(sourcePatch, verifyTemplate, result, TemplateMatchModes.CCoeffNormed);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Cv2.MinMaxLoc(result, out _, out double maxValue, out _, out _);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    StopPhaseTiming("HybridVerify.ImageScore", imageScoreStart);
+                    imageScore = NormalizeTemplateMatchScore(maxValue);
+                    return true;
+                }
+            }
+        }
+
+        private static bool IsNearHybridBestImageCandidate(
+            MatchCandidate candidate,
+            MatchCandidate bestImageCandidate,
+            Mat template)
+        {
+            if (candidate == null || bestImageCandidate == null)
+            {
+                return false;
+            }
+
+            double dx = candidate.TemplateCenter.X - bestImageCandidate.TemplateCenter.X;
+            double dy = candidate.TemplateCenter.Y - bestImageCandidate.TemplateCenter.Y;
+            double distance = Math.Sqrt((dx * dx) + (dy * dy));
+            double candidateScale = NormalizeScale(candidate.Scale);
+            double threshold = Math.Max(6D, Math.Min(template.Width, template.Height) * candidateScale * 0.35D);
+            return distance <= threshold;
+        }
+
+        private bool TryComputeHybridEdgeDescriptorScore(
+            Mat source,
+            Mat template,
+            MatchCandidate candidate,
+            out double score)
+        {
+            score = double.NaN;
+            using (Mat verifyTemplate = CreateHybridVerifyTemplate(template, candidate.Angle, candidate.Scale))
+            using (Mat templateEdges = new Mat())
+            {
+                Rect patchRect = CreateTemplatePatchRect(source, verifyTemplate, candidate);
+                if (patchRect.Width <= 0 || patchRect.Height <= 0)
+                {
+                    return false;
+                }
+
+                using (Mat sourcePatch = new Mat(source, patchRect))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    long descriptorTemplateStart = StartPhaseTiming();
+                    Cv2.Canny(
+                        verifyTemplate,
+                        templateEdges,
+                        property.CANNY_LOW,
+                        property.CANNY_HIGH,
+                        NormalizeCannyAperture(property.CANNY_APERTURE_SIZE),
+                        property.USE_L2_GRADIENT);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    StopPhaseTiming("HybridVerify.DescriptorTemplateCanny", descriptorTemplateStart);
+                    return TryComputeHybridEdgeDescriptorScore(sourcePatch, templateEdges, out score);
+                }
+            }
+        }
+
+        private bool TryComputeHybridEdgeDescriptorScore(Mat sourcePatch, Mat templateEdges, out double score)
+        {
+            score = double.NaN;
+            if (OpenCvHelper.IsImageEmpty(sourcePatch)
+                || OpenCvHelper.IsImageEmpty(templateEdges)
+                || sourcePatch.Width != templateEdges.Width
+                || sourcePatch.Height != templateEdges.Height)
+            {
+                return false;
+            }
+
+            using (Mat sourceEdges = new Mat())
+            using (Mat result = new Mat())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                long descriptorSourceStart = StartPhaseTiming();
+                Cv2.Canny(
+                    sourcePatch,
+                    sourceEdges,
+                    property.CANNY_LOW,
+                    property.CANNY_HIGH,
+                    NormalizeCannyAperture(property.CANNY_APERTURE_SIZE),
+                    property.USE_L2_GRADIENT);
+                cancellationToken.ThrowIfCancellationRequested();
+                StopPhaseTiming("HybridVerify.DescriptorSourceCanny", descriptorSourceStart);
+
+                if (Cv2.CountNonZero(sourceEdges) == 0 || Cv2.CountNonZero(templateEdges) == 0)
+                {
+                    return false;
+                }
+
+                long descriptorMatchStart = StartPhaseTiming();
+                Cv2.MatchTemplate(sourceEdges, templateEdges, result, TemplateMatchModes.CCoeffNormed);
+                cancellationToken.ThrowIfCancellationRequested();
+                Cv2.MinMaxLoc(result, out _, out double maxValue, out _, out _);
+                cancellationToken.ThrowIfCancellationRequested();
+                StopPhaseTiming("HybridVerify.DescriptorMatch", descriptorMatchStart);
+                score = NormalizeTemplateMatchScore(maxValue);
+                return true;
+            }
+        }
+
+        private static double BlendHybridVerificationScore(double imageScore, double descriptorScore)
+        {
+            double descriptorWeight = Clamp(HybridEdgeDescriptorWeight, 0D, 1D);
+            return (imageScore * (1D - descriptorWeight)) + (descriptorScore * descriptorWeight);
+        }
+
+        private static Rect CreateTemplatePatchRect(Mat source, Mat template, MatchCandidate candidate)
+        {
+            int x = (int)Math.Round(candidate.TemplateCenter.X - (template.Width / 2D));
+            int y = (int)Math.Round(candidate.TemplateCenter.Y - (template.Height / 2D));
+            if (x < 0 || y < 0 || x + template.Width > source.Width || y + template.Height > source.Height)
+            {
+                return new Rect();
+            }
+
+            return new Rect(x, y, template.Width, template.Height);
+        }
+
+        private Mat CreateHybridVerifyTemplate(Mat template, double angle)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Math.Abs(angle) <= 0.0001D)
+            {
+                Mat clone = template.Clone();
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return clone;
+                }
+                catch
+                {
+                    clone.Dispose();
+                    throw;
+                }
+            }
+
+            Mat rotated = new Mat();
+            try
+            {
+                Point2f center = new Point2f((template.Width - 1) / 2f, (template.Height - 1) / 2f);
+                using (Mat rotation = Cv2.GetRotationMatrix2D(center, angle, 1D))
+                {
+                    Cv2.WarpAffine(
+                        template,
+                        rotated,
+                        rotation,
+                        template.Size(),
+                        InterpolationFlags.Linear,
+                        BorderTypes.Constant,
+                        Scalar.Black);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                return rotated;
+            }
+            catch
+            {
+                rotated.Dispose();
+                throw;
+            }
+        }
+
+        private Mat CreateHybridVerifyTemplate(Mat template, double angle, double scale)
+        {
+            using (Mat scaledTemplate = ResizeTemplateForScale(template, scale))
+            {
+                return CreateHybridVerifyTemplate(scaledTemplate, angle);
+            }
+        }
+
+        public bool ShouldUseHybridVerify()
+        {
+            return property.USE_HYBRID_VERIFY
+                && property.HYBRID_VERIFY_TOP_N > 0
+                && property.HYBRID_VERIFY_IMAGE_WEIGHT > 0D;
+        }
+
+        public int GetCandidateSeedCapacity()
+        {
+            int capacity = 0;
+            if (property.USE_POSITION_REFINE && property.SEARCH_STEP > 1)
+            {
+                capacity = Math.Max(capacity, PositionRefineSeedCount);
+            }
+
+            if (ShouldUseHybridVerify())
+            {
+                // Hybrid verification needs more than a global top-N. A spatial grid keeps
+                // candidates from other image regions alive when distractors dominate one area.
+                int hybridCapacity = property.HYBRID_VERIFY_TOP_N
+                    + (HybridCandidateGridColumns * HybridCandidateGridRows * HybridCandidateGridTopK);
+                capacity = Math.Max(capacity, hybridCapacity);
+            }
+
+            if (property.USE_UNIQUE_MATCH_VALIDATION)
+            {
+                capacity = Math.Max(capacity, UniqueMatchMinimumInternalTopK);
+            }
+
+            return capacity;
+        }
+
+        public bool ShouldUseHybridSpatialSeeds()
+        {
+            return ShouldUseHybridVerify() || property.USE_UNIQUE_MATCH_VALIDATION;
+        }
+
+        private static bool IsBetterHybridCandidate(MatchCandidate candidate, MatchCandidate currentBest)
+        {
+            if (candidate == null || double.IsNaN(candidate.HybridScore))
+            {
+                return false;
+            }
+
+            if (currentBest == null || double.IsNaN(currentBest.HybridScore))
+            {
+                return true;
+            }
+
+            const double epsilon = 0.0000001D;
+            if (candidate.HybridScore > currentBest.HybridScore + epsilon)
+            {
+                return true;
+            }
+
+            if (Math.Abs(candidate.HybridScore - currentBest.HybridScore) > epsilon)
+            {
+                return false;
+            }
+
+            return IsBetterCandidate(candidate, currentBest);
+        }
+
+    }
+
+        private void DrawResultImage()
+        {
+            ReplaceResultImage(imageSource.Clone());
+            OpenCvHelper.SetImageChannel3(imageResult);
+            TemplateModelCache modelCache = modelStore.Current;
+
+            foreach (MatchingResult result in results)
+            {
+                Rect rect = new Rect(
+                    (int)Math.Round(result.Bounding.X),
+                    (int)Math.Round(result.Bounding.Y),
+                    (int)Math.Round(result.Bounding.Width),
+                    (int)Math.Round(result.Bounding.Height));
+                if (!DrawEdgeModelOutline(modelCache, result, new Scalar(50, 205, 50)))
+                {
+                    // Fallback only: EdgeBasedMatching should normally draw the taught edge model, not a box.
+                    Cv2.Rectangle(imageResult, rect, new Scalar(50, 205, 50), 2);
+                }
+
+                Cv2.Circle(
+                    imageResult,
+                    new OpenCvSharp.Point((int)Math.Round(result.Center.X), (int)Math.Round(result.Center.Y)),
+                    4,
+                    Scalar.Red,
+                    -1);
+                Cv2.PutText(
+                    imageResult,
+                    $"#{result.Index} {result.Score:0.0} {(result.PolarityReversed ? "Reversed" : "Same")}",
+                    new OpenCvSharp.Point(rect.X, Math.Max(14, rect.Y - 5)),
+                    HersheyFonts.HersheySimplex,
+                    0.45,
+                    Scalar.Yellow,
+                    1,
+                    LineTypes.AntiAlias);
+            }
+        }
+
+        private EdgeBasedMatchingDiagnosticEvidence CreateDiagnosticEvidence(VisionToolResult result)
+        {
+            EdgeTemplateModel model = modelStore.Current?.Model;
+            Rect searchRoi = property?.USE_ROI == true
+                ? NormalizeRoi(property.CvROI)
+                : new Rect(0, 0, Math.Max(0, imageSource?.Width ?? 0), Math.Max(0, imageSource?.Height ?? 0));
+            EdgeBasedMatchingDiagnosticEvidence evidence = new EdgeBasedMatchingDiagnosticEvidence
+            {
+                State = ResolveDiagnosticState(result),
+                ErrorCode = result?.ErrorName ?? string.Empty,
+                SearchRoi = new RectangleF(searchRoi.X, searchRoi.Y, searchRoi.Width, searchRoi.Height),
+                TemplateWidth = Math.Max(0, model?.Width ?? 0),
+                TemplateHeight = Math.Max(0, model?.Height ?? 0),
+                ModelCenter = new PointF(
+                    (float)(model?.Center.X ?? 0D),
+                    (float)(model?.Center.Y ?? 0D)),
+                SelectedCandidate = candidateDiagnostics.SelectedCandidate?.Clone(),
+                StrongestSpatialAlternative = candidateDiagnostics.StrongestSpatialAlternative?.Clone(),
+                StrongestPoseAlternative = candidateDiagnostics.StrongestPoseAlternative?.Clone()
+            };
+            if (model?.Points != null)
+            {
+                evidence.ModelPoints.AddRange(model.Points.Select(point => new PointF(point.X, point.Y)));
+            }
+
+            evidence.Reason = ResolveDiagnosticReason(result, evidence);
+            return evidence;
+        }
+
+        private string ResolveDiagnosticReason(
+            VisionToolResult result,
+            EdgeBasedMatchingDiagnosticEvidence evidence)
+        {
+            if (!string.IsNullOrWhiteSpace(result?.Message))
+            {
+                return result.Message;
+            }
+
+            EdgeBasedMatchingCandidateDiagnostic selected = evidence?.SelectedCandidate;
+            if (result?.Success == true && selected != null)
+            {
+                EdgeBasedMatchingCandidateDiagnostic alternative = evidence.StrongestSpatialAlternative;
+                string alternativeText = alternative == null
+                    ? "StrongestSpatialAlternative=None"
+                    : string.Format(
+                        CultureInfo.InvariantCulture,
+                        "StrongestSpatialAlternative={0:0.###}, ScoreMargin={1:0.###}",
+                        alternative.Score,
+                        selected.Score - alternative.Score);
+                return string.Format(
+                    CultureInfo.InvariantCulture,
+                    "Success: selected score {0:0.###} >= SCORE_MIN {1:0.###}; {2}.",
+                    selected.Score,
+                    property?.SCORE_MIN ?? 0D,
+                    alternativeText);
+            }
+
+            return "Edge based matching did not retain a candidate decision.";
+        }
+
+        private static string ResolveDiagnosticState(VisionToolResult result)
+        {
+            if (result?.Success == true)
+            {
+                return "Success";
+            }
+
+            switch (result?.ErrorCode)
+            {
+                case VisionToolErrorCode.MatchingNoResult:
+                    return "NoMatch";
+                case VisionToolErrorCode.MatchingAmbiguous:
+                    return "Ambiguous";
+                default:
+                    return "Error";
+            }
+        }
+
+        private bool DrawEdgeModelOutline(TemplateModelCache modelCache, MatchingResult result, Scalar color)
+        {
+            if (modelCache?.Model == null || modelCache.Model.Points.Count == 0)
+            {
+                return false;
+            }
+
+            RotatedEdgeTemplateModel rotatedModel = modelCache.GetRotatedModel(result.Angle, result.Scale);
+            if (rotatedModel.PointCount == 0)
+            {
+                return false;
+            }
+
+            double modelCenterX = result.Center.X - rotatedModel.TemplateCenterOffsetX;
+            double modelCenterY = result.Center.Y - rotatedModel.TemplateCenterOffsetY;
+            int drawnPointCount = 0;
+            foreach (RotatedTemplateEdgePoint point in rotatedModel.Points)
+            {
+                int x = (int)Math.Round(modelCenterX + point.OffsetX);
+                int y = (int)Math.Round(modelCenterY + point.OffsetY);
+                if (x < 0 || y < 0 || x >= imageResult.Width || y >= imageResult.Height)
+                {
+                    continue;
+                }
+
+                Cv2.Circle(
+                    imageResult,
+                    new OpenCvSharp.Point(x, y),
+                    1,
+                    color,
+                    -1,
+                    LineTypes.AntiAlias);
+                drawnPointCount++;
+            }
+
+            return drawnPointCount > 0;
+        }
+
+        private void ResetMatchingFailure()
+        {
+            lastMatchingErrorCode = VisionToolErrorCode.MatchingNoResult;
+            lastMatchingMessage = "Edge based template matching found no result.";
+        }
+
+        private void SetMatchingFailure(VisionToolErrorCode errorCode, string message)
+        {
+            if (results.Count > 0)
+            {
+                return;
+            }
+
+            lastMatchingErrorCode = errorCode;
+            lastMatchingMessage = message ?? string.Empty;
+        }
+
+        private string FormatMatchingOptions()
+        {
+            string roi = property.USE_MULTI_ROI
+                ? $"Multi({property.CvROIS?.Count ?? 0})"
+                : FormatRoi(NormalizeRoi(property.CvROI));
+            string angle = property.USE_FIND_ANGLE
+                ? $"Angle={property.FIND_ANGLE_MIN}..{property.FIND_ANGLE_MAX}/Step={property.FIND_ANGLE}"
+                : "Angle=Off";
+            if (property.USE_FIND_ANGLE && ShouldUseCoarseToFineAngleSearch())
+            {
+                angle += $"/Coarse={property.COARSE_ANGLE_STEP}/TopK={property.COARSE_ANGLE_TOP_K}";
+            }
+
+            string position = property.USE_POSITION_REFINE && property.SEARCH_STEP > 1
+                ? $"SearchStep={property.SEARCH_STEP}+Refine"
+                : $"SearchStep={property.SEARCH_STEP}";
+            if (property.USE_SUBPIXEL_REFINE)
+            {
+                position += "+Subpixel";
+            }
+
+            string scale = property.USE_FIND_SCALE
+                ? $"Scale={property.FIND_SCALE_MIN:0.###}..{property.FIND_SCALE_MAX:0.###}/Step={property.FIND_SCALE_STEP:0.###}"
+                : "Scale=Off";
+            string pyramid = property.USE_PYRAMID_POSITION_PROPOSAL
+                ? $", PyramidProposal=Top{property.PYRAMID_POSITION_TOP_N}/Min{property.PYRAMID_POSITION_MIN_SCORE:0.###}"
+                : string.Empty;
+            string hybrid = ShouldUseHybridVerify()
+                ? $", Hybrid=Top{property.HYBRID_VERIFY_TOP_N}/W{property.HYBRID_VERIFY_IMAGE_WEIGHT:0.###}"
+                : string.Empty;
+            string unique = property.USE_UNIQUE_MATCH_VALIDATION
+                ? $", Unique=Margin{property.UNIQUE_MATCH_MIN_SCORE_MARGIN:0.###}"
+                : string.Empty;
+            string polarity = property.ALLOW_GLOBAL_POLARITY_REVERSAL
+                ? ", Polarity=SameOrGloballyReversed"
+                : ", Polarity=Same";
+            return $"ScoreMin={property.SCORE_MIN}, MatchCount={property.NUM_MATCH}, Canny={property.CANNY_LOW}..{property.CANNY_HIGH}, {angle}, {scale}, {position}{pyramid}{hybrid}{unique}{polarity}, MaxPoints={property.MAX_TEMPLATE_POINTS}, ROI={roi}";
+        }
+
+        private static string FormatRoi(Rect roi)
+        {
+            return $"{roi.X},{roi.Y},{roi.Width},{roi.Height}";
+        }
+
+        private static int NormalizeCannyAperture(int value)
+        {
+            if (value <= 3)
+            {
+                return 3;
+            }
+
+            if (value <= 5)
+            {
+                return 5;
+            }
+
+            return 7;
+        }
+
+        private static double Clamp(double value, double min, double max)
+        {
+            if (value < min) { return min; }
+            if (value > max) { return max; }
+            return value;
+        }
+
+        private static double NormalizeScale(double scale)
+        {
+            return scale <= 0D ? 1D : Math.Round(scale, 6);
+        }
+
+        private static string CreateAngleScaleKey(double angle, double scale)
+        {
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0:0.######}:{1:0.######}",
+                Math.Round(angle, 6),
+                NormalizeScale(scale));
+        }
+
+        private static Mat ResizeTemplateForScale(Mat template, double scale)
+        {
+            if (OpenCvHelper.IsImageEmpty(template))
+            {
+                return new Mat();
+            }
+
+            double normalizedScale = NormalizeScale(scale);
+            if (Math.Abs(normalizedScale - 1D) <= 0.000001D)
+            {
+                return template.Clone();
+            }
+
+            Mat resized = new Mat();
+            Cv2.Resize(
+                template,
+                resized,
+                new OpenCvSharp.Size(
+                    Math.Max(1, (int)Math.Round(template.Width * normalizedScale)),
+                    Math.Max(1, (int)Math.Round(template.Height * normalizedScale))),
+                0D,
+                0D,
+                normalizedScale < 1D ? InterpolationFlags.Area : InterpolationFlags.Linear);
+            return resized;
+        }
+
+        private static int Clamp(int value, int min, int max)
+        {
+            if (value < min) { return min; }
+            if (value > max) { return max; }
+            return value;
+        }
+
+        private static List<TemplateEdgePoint> Downsample(List<TemplateEdgePoint> points, int maxPoints)
+        {
+            if (points == null || points.Count <= maxPoints)
+            {
+                return points ?? new List<TemplateEdgePoint>();
+            }
+
+            List<TemplateEdgePoint> sampled = new List<TemplateEdgePoint>(maxPoints);
+            double step = (double)points.Count / maxPoints;
+            for (int i = 0; i < maxPoints; i++)
+            {
+                sampled.Add(points[(int)Math.Floor(i * step)]);
+            }
+
+            return sampled;
+        }
+
+        private sealed class GradientImage : IDisposable
+        {
+            private const int MagnitudeBatchBytes = 4 * 1024 * 1024;
+
+            private GradientImage(
+                int width,
+                int height,
+                double[] magnitudeValues,
+                double[] unitDxValues,
+                double[] unitDyValues)
+            {
+                Width = width;
+                Height = height;
+                MagnitudeValues = magnitudeValues ?? Array.Empty<double>();
+                UnitDxValues = unitDxValues ?? Array.Empty<double>();
+                UnitDyValues = unitDyValues ?? Array.Empty<double>();
+            }
+
+            public int Width { get; }
+            public int Height { get; }
+            private double[] MagnitudeValues { get; }
+            public double[] UnitDxValues { get; }
+            public double[] UnitDyValues { get; }
+
+            public static unsafe GradientImage Create(
+                Mat image,
+                double unitMagnitudeThreshold,
+                CancellationToken cancellationToken,
+                bool retainMagnitude = false)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int width = image.Width;
+                int height = image.Height;
+                int length = width * height;
+                double[] unitDxValues = new double[length];
+                double[] unitDyValues = new double[length];
+                double[] magnitudeValues = retainMagnitude ? new double[length] : Array.Empty<double>();
+                int rowsPerBatch = Math.Max(1, Math.Min(height, (MagnitudeBatchBytes / sizeof(double)) / width));
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // OpenCV writes Sobel into the final arrays. Headers and scratch are released before unpinning.
+                fixed (double* unitDx = unitDxValues)
+                fixed (double* unitDy = unitDyValues)
+                using (Mat dx = new Mat(height, width, MatType.CV_64FC1, (IntPtr)unitDx))
+                using (Mat dy = new Mat(height, width, MatType.CV_64FC1, (IntPtr)unitDy))
+                using (Mat magnitude = new Mat(rowsPerBatch, width, MatType.CV_64FC1))
+                {
+                    Cv2.Sobel(image, dx, MatType.CV_64F, 1, 0, 3);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Cv2.Sobel(image, dy, MatType.CV_64F, 0, 1, 3);
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    for (int firstRow = 0; firstRow < height; firstRow += rowsPerBatch)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        int rowCount = Math.Min(rowsPerBatch, height - firstRow);
+                        using (Mat dxRows = dx.RowRange(firstRow, firstRow + rowCount))
+                        using (Mat dyRows = dy.RowRange(firstRow, firstRow + rowCount))
+                        using (Mat magnitudeRows = magnitude.RowRange(0, rowCount))
+                        {
+                            Cv2.Magnitude(dxRows, dyRows, magnitudeRows);
+                            cancellationToken.ThrowIfCancellationRequested();
+                            int index = firstRow * width;
+                            for (int y = 0; y < rowCount; y++)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                double* magnitudes = (double*)magnitudeRows.Ptr(y);
+                                for (int x = 0; x < width; x++, index++)
+                                {
+                                    if ((index & 4095) == 0) cancellationToken.ThrowIfCancellationRequested();
+                                    double value = magnitudes[x];
+                                    if (retainMagnitude) magnitudeValues[index] = value;
+                                    if (value <= unitMagnitudeThreshold)
+                                    {
+                                        unitDxValues[index] = 0D;
+                                        unitDyValues[index] = 0D;
+                                        continue;
+                                    }
+
+                                    double inverseMagnitude = 1D / value;
+                                    unitDxValues[index] *= inverseMagnitude;
+                                    unitDyValues[index] *= inverseMagnitude;
+                                }
+                            }
+                        }
+                    }
+
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return new GradientImage(width, height, magnitudeValues, unitDxValues, unitDyValues);
+                }
+            }
+
+            public double GetMagnitude(int x, int y)
+            {
+                return MagnitudeValues[GetIndex(x, y)];
+            }
+
+            public double GetUnitDx(int x, int y)
+            {
+                return UnitDxValues[GetIndex(x, y)];
+            }
+
+            public double GetUnitDy(int x, int y)
+            {
+                return UnitDyValues[GetIndex(x, y)];
+            }
+
+            private int GetIndex(int x, int y)
+            {
+                return (y * Width) + x;
+            }
+
+            public void Dispose()
+            {
+            }
+        }
+
+        private sealed class TemplateModelCache : IDisposable
+        {
+            private readonly object sync = new object();
+            private readonly Func<Mat, double, EdgeTemplateModel> modelFactory;
+            private readonly Dictionary<string, List<RotatedEdgeTemplateModel>> searchModels
+                = new Dictionary<string, List<RotatedEdgeTemplateModel>>(StringComparer.Ordinal);
+            private readonly Dictionary<double, EdgeTemplateModel> scaledModels
+                = new Dictionary<double, EdgeTemplateModel>();
+            private readonly Dictionary<string, RotatedEdgeTemplateModel> rotatedModels
+                = new Dictionary<string, RotatedEdgeTemplateModel>(StringComparer.Ordinal);
+
+            public TemplateModelCache(
+                string key,
+                Mat preparedTemplate,
+                EdgeTemplateModel model,
+                Func<Mat, double, EdgeTemplateModel> modelFactory)
+            {
+                Key = key ?? string.Empty;
+                PreparedTemplate = preparedTemplate ?? new Mat();
+                Model = model;
+                this.modelFactory = modelFactory ?? throw new ArgumentNullException(nameof(modelFactory));
+            }
+
+            public string Key { get; }
+            public Mat PreparedTemplate { get; }
+            public EdgeTemplateModel Model { get; }
+
+            public List<RotatedEdgeTemplateModel> GetSearchModels(
+                string key,
+                IEnumerable<double> angles,
+                IEnumerable<double> scales)
+            {
+                key = key ?? string.Empty;
+                lock (sync)
+                {
+                    if (searchModels.TryGetValue(key, out List<RotatedEdgeTemplateModel> cached))
+                    {
+                        return cached;
+                    }
+
+                    List<RotatedEdgeTemplateModel> created = new List<RotatedEdgeTemplateModel>();
+                    foreach (double scale in scales ?? new[] { 1D })
+                    {
+                        foreach (double angle in angles ?? Enumerable.Empty<double>())
+                        {
+                            created.Add(GetRotatedModelCore(angle, scale));
+                        }
+                    }
+
+                    searchModels[key] = created;
+                    return created;
+                }
+            }
+
+            public RotatedEdgeTemplateModel GetRotatedModel(double angle)
+            {
+                return GetRotatedModel(angle, 1D);
+            }
+
+            public RotatedEdgeTemplateModel GetRotatedModel(double angle, double scale)
+            {
+                lock (sync)
+                {
+                    return GetRotatedModelCore(angle, scale);
+                }
+            }
+
+            private RotatedEdgeTemplateModel GetRotatedModelCore(double angle, double scale)
+            {
+                double normalizedAngle = Math.Round(angle, 6);
+                double normalizedScale = NormalizeScale(scale);
+                string key = CreateAngleScaleKey(normalizedAngle, normalizedScale);
+                if (!rotatedModels.TryGetValue(key, out RotatedEdgeTemplateModel model))
+                {
+                    model = CreateRotatedModel(GetScaledModelCore(normalizedScale), normalizedAngle);
+                    rotatedModels[key] = model;
+                }
+
+                return model;
+            }
+
+            private EdgeTemplateModel GetScaledModelCore(double scale)
+            {
+                double normalizedScale = NormalizeScale(scale);
+                if (Math.Abs(normalizedScale - 1D) <= 0.000001D)
+                {
+                    return Model;
+                }
+
+                if (!scaledModels.TryGetValue(normalizedScale, out EdgeTemplateModel model))
+                {
+                    using (Mat scaledTemplate = ResizeTemplateForScale(PreparedTemplate, normalizedScale))
+                    {
+                        model = modelFactory(scaledTemplate, normalizedScale);
+                    }
+
+                    scaledModels[normalizedScale] = model;
+                }
+
+                return model;
+            }
+
+            public void Dispose()
+            {
+                lock (sync)
+                {
+                    PreparedTemplate?.Dispose();
+                    searchModels.Clear();
+                    scaledModels.Clear();
+                    rotatedModels.Clear();
+                }
+            }
+        }
+
+        private sealed class EdgeTemplateModel
+        {
+            public EdgeTemplateModel(
+                int width,
+                int height,
+                Point2d center,
+                List<TemplateEdgePoint> points,
+                int rawPointCount,
+                double scale)
+            {
+                Width = width;
+                Height = height;
+                Center = center;
+                Points = points ?? new List<TemplateEdgePoint>();
+                RawPointCount = rawPointCount < 0 ? Points.Count : rawPointCount;
+                Scale = NormalizeScale(scale);
+            }
+
+            public int Width { get; }
+            public int Height { get; }
+            public Point2d Center { get; }
+            public List<TemplateEdgePoint> Points { get; }
+            public int RawPointCount { get; }
+            public double Scale { get; }
+        }
+
+        private sealed class PyramidLevelDiagnostics
+        {
+            public PyramidLevelDiagnostics(int edgePointCount, double coverageArea, double quadrantBalance)
+            {
+                EdgePointCount = edgePointCount;
+                CoverageArea = coverageArea;
+                QuadrantBalance = quadrantBalance;
+            }
+
+            public int EdgePointCount { get; }
+            public double CoverageArea { get; }
+            public double QuadrantBalance { get; }
+        }
+
+        private sealed class RotatedEdgeTemplateModel
+        {
+            private readonly object indexOffsetSync = new object();
+            private readonly Dictionary<int, int[]> indexOffsetsByImageWidth = new Dictionary<int, int[]>();
+
+            public RotatedEdgeTemplateModel(
+                int templateWidth,
+                int templateHeight,
+                double angle,
+                List<RotatedTemplateEdgePoint> points,
+                int minOffsetX,
+                int maxOffsetX,
+                int minOffsetY,
+                int maxOffsetY,
+                RectangleF localBounds,
+                double templateCenterOffsetX,
+                double templateCenterOffsetY,
+                double scale)
+            {
+                TemplateWidth = templateWidth;
+                TemplateHeight = templateHeight;
+                Angle = angle;
+                Scale = NormalizeScale(scale);
+                Points = points ?? new List<RotatedTemplateEdgePoint>();
+                MinOffsetX = minOffsetX;
+                MaxOffsetX = maxOffsetX;
+                MinOffsetY = minOffsetY;
+                MaxOffsetY = maxOffsetY;
+                LocalBounds = localBounds;
+                TemplateCenterOffsetX = templateCenterOffsetX;
+                TemplateCenterOffsetY = templateCenterOffsetY;
+                PointCount = Points.Count;
+                OffsetXValues = new int[PointCount];
+                OffsetYValues = new int[PointCount];
+                UnitDxValues = new double[PointCount];
+                UnitDyValues = new double[PointCount];
+                for (int i = 0; i < PointCount; i++)
+                {
+                    RotatedTemplateEdgePoint point = Points[i];
+                    OffsetXValues[i] = point.OffsetX;
+                    OffsetYValues[i] = point.OffsetY;
+                    UnitDxValues[i] = point.UnitDx;
+                    UnitDyValues[i] = point.UnitDy;
+                }
+            }
+
+            public int TemplateWidth { get; }
+            public int TemplateHeight { get; }
+            public double Angle { get; }
+            public double Scale { get; }
+            public List<RotatedTemplateEdgePoint> Points { get; }
+            public int PointCount { get; }
+            public int[] OffsetXValues { get; }
+            public int[] OffsetYValues { get; }
+            public double[] UnitDxValues { get; }
+            public double[] UnitDyValues { get; }
+            public int MinOffsetX { get; }
+            public int MaxOffsetX { get; }
+            public int MinOffsetY { get; }
+            public int MaxOffsetY { get; }
+            public RectangleF LocalBounds { get; }
+            public double TemplateCenterOffsetX { get; }
+            public double TemplateCenterOffsetY { get; }
+
+            public int[] GetIndexOffsets(int imageWidth)
+            {
+                lock (indexOffsetSync)
+                {
+                    if (indexOffsetsByImageWidth.TryGetValue(imageWidth, out int[] cached))
+                    {
+                        return cached;
+                    }
+
+                    int[] created = new int[PointCount];
+                    for (int i = 0; i < PointCount; i++)
+                    {
+                        created[i] = (OffsetYValues[i] * imageWidth) + OffsetXValues[i];
+                    }
+
+                    indexOffsetsByImageWidth[imageWidth] = created;
+                    return created;
+                }
+            }
+        }
+
+        private sealed class TemplateEdgePoint
+        {
+            public int X { get; set; }
+            public int Y { get; set; }
+            public int OffsetX { get; set; }
+            public int OffsetY { get; set; }
+            public double UnitDx { get; set; }
+            public double UnitDy { get; set; }
+            public double InvMagnitude { get; set; }
+        }
+
+        private sealed class RotatedTemplateEdgePoint
+        {
+            public int OffsetX { get; set; }
+            public int OffsetY { get; set; }
+            public double UnitDx { get; set; }
+            public double UnitDy { get; set; }
+        }
+
+        private sealed class CandidateScoreContext
+        {
+            public CandidateScoreContext(
+                int imageWidth,
+                int pointCount,
+                int[] indexOffsets,
+                int[] offsetXValues,
+                int[] offsetYValues,
+                double[] templateUnitDxValues,
+                double[] templateUnitDyValues,
+                double[] sourceUnitDxValues,
+                double[] sourceUnitDyValues,
+                double[] breakSumThresholds,
+                bool allowGlobalPolarityReversal)
+            {
+                ImageWidth = imageWidth;
+                PointCount = pointCount;
+                IndexOffsets = indexOffsets ?? Array.Empty<int>();
+                OffsetXValues = offsetXValues ?? Array.Empty<int>();
+                OffsetYValues = offsetYValues ?? Array.Empty<int>();
+                TemplateUnitDxValues = templateUnitDxValues ?? Array.Empty<double>();
+                TemplateUnitDyValues = templateUnitDyValues ?? Array.Empty<double>();
+                SourceUnitDxValues = sourceUnitDxValues ?? Array.Empty<double>();
+                SourceUnitDyValues = sourceUnitDyValues ?? Array.Empty<double>();
+                BreakSumThresholds = breakSumThresholds ?? Array.Empty<double>();
+                AllowGlobalPolarityReversal = allowGlobalPolarityReversal;
+            }
+
+            public int ImageWidth { get; }
+            public int PointCount { get; }
+            public int[] IndexOffsets { get; }
+            public int[] OffsetXValues { get; }
+            public int[] OffsetYValues { get; }
+            public double[] TemplateUnitDxValues { get; }
+            public double[] TemplateUnitDyValues { get; }
+            public double[] SourceUnitDxValues { get; }
+            public double[] SourceUnitDyValues { get; }
+            public double[] BreakSumThresholds { get; }
+            public bool AllowGlobalPolarityReversal { get; }
+        }
+
+        private sealed class CandidateSearchState
+        {
+            private readonly int seedCapacity;
+            private readonly SpatialCandidateSeedTracker spatialSeeds;
+
+            public CandidateSearchState(
+                int seedCapacity,
+                bool useSpatialSeeds,
+                int minCenterX,
+                int minCenterY,
+                int maxCenterX,
+                int maxCenterY)
+            {
+                this.seedCapacity = Math.Max(0, seedCapacity);
+                CandidateSeeds = this.seedCapacity > 0
+                    ? new List<MatchCandidate>(this.seedCapacity)
+                    : null;
+                spatialSeeds = useSpatialSeeds
+                    ? new SpatialCandidateSeedTracker(
+                        minCenterX,
+                        minCenterY,
+                        maxCenterX,
+                        maxCenterY,
+                        HybridCandidateGridColumns,
+                        HybridCandidateGridRows,
+                        HybridCandidateGridTopK)
+                    : null;
+            }
+
+            public MatchCandidate Best { get; private set; }
+            public List<MatchCandidate> CandidateSeeds { get; }
+
+            public void Consider(
+                RotatedEdgeTemplateModel model,
+                int centerX,
+                int centerY,
+                double score)
+            {
+                MatchCandidate candidate = null;
+                if (IsBetterScore(score, centerX, centerY, Best))
+                {
+                    candidate = CreateMatchCandidate(
+                        model,
+                        centerX,
+                        centerY,
+                        CreateLocalBounds(centerX, centerY, model),
+                        score);
+                    Best = candidate;
+                }
+
+                bool shouldTrackSeed = ShouldTrackCandidateSeed(CandidateSeeds, score, seedCapacity, centerX, centerY);
+                bool shouldTrackSpatialSeed = spatialSeeds?.ShouldTrack(centerX, centerY, score) ?? false;
+                if (shouldTrackSeed)
+                {
+                    candidate = candidate ?? CreateMatchCandidate(
+                        model,
+                        centerX,
+                        centerY,
+                        CreateLocalBounds(centerX, centerY, model),
+                        score);
+                    TrackCandidateSeed(CandidateSeeds, candidate, seedCapacity);
+                }
+
+                if (shouldTrackSpatialSeed)
+                {
+                    candidate = candidate ?? CreateMatchCandidate(
+                        model,
+                        centerX,
+                        centerY,
+                        CreateLocalBounds(centerX, centerY, model),
+                        score);
+                    spatialSeeds.Track(candidate);
+                }
+            }
+
+            public void Merge(CandidateSearchState other)
+            {
+                if (other == null)
+                {
+                    return;
+                }
+
+                if (IsBetterCandidate(other.Best, Best))
+                {
+                    Best = other.Best;
+                }
+
+                if (CandidateSeeds == null || other.CandidateSeeds == null)
+                {
+                    return;
+                }
+
+                foreach (MatchCandidate seed in other.CandidateSeeds)
+                {
+                    TrackCandidateSeed(CandidateSeeds, seed, seedCapacity);
+                }
+
+                spatialSeeds?.Merge(other.spatialSeeds);
+            }
+
+            public List<MatchCandidate> CreateMergedCandidateSeeds()
+            {
+                if (CandidateSeeds == null)
+                {
+                    return null;
+                }
+
+                MergeCandidateSeeds(CandidateSeeds, spatialSeeds?.GetCandidates(), seedCapacity);
+                return CandidateSeeds;
+            }
+        }
+
+        private sealed class SpatialCandidateSeedTracker
+        {
+            private readonly int minCenterX;
+            private readonly int minCenterY;
+            private readonly double width;
+            private readonly double height;
+            private readonly int columns;
+            private readonly int rows;
+            private readonly int cellCapacity;
+            private readonly List<MatchCandidate>[] candidates;
+
+            public SpatialCandidateSeedTracker(
+                int minCenterX,
+                int minCenterY,
+                int maxCenterX,
+                int maxCenterY,
+                int columns,
+                int rows,
+                int cellCapacity)
+            {
+                this.minCenterX = minCenterX;
+                this.minCenterY = minCenterY;
+                this.columns = Math.Max(1, columns);
+                this.rows = Math.Max(1, rows);
+                this.cellCapacity = Math.Max(1, cellCapacity);
+                width = Math.Max(1D, maxCenterX - minCenterX + 1D);
+                height = Math.Max(1D, maxCenterY - minCenterY + 1D);
+                candidates = new List<MatchCandidate>[this.columns * this.rows];
+            }
+
+            public bool ShouldTrack(int centerX, int centerY, double score)
+            {
+                List<MatchCandidate> cell = candidates[GetIndex(centerX, centerY)];
+                return cell == null
+                    || cell.Count < cellCapacity
+                    || score > cell[cell.Count - 1].Score
+                    || (score == cell[cell.Count - 1].Score && IsBetterScore(score, centerX, centerY, cell[cell.Count - 1]));
+            }
+
+            public void Track(MatchCandidate candidate)
+            {
+                if (candidate == null)
+                {
+                    return;
+                }
+
+                int index = GetIndex(candidate.Center.X, candidate.Center.Y);
+                if (candidates[index] == null)
+                {
+                    candidates[index] = new List<MatchCandidate>(cellCapacity);
+                }
+
+                TrackCandidateSeed(candidates[index], candidate, cellCapacity);
+            }
+
+            public void Merge(SpatialCandidateSeedTracker other)
+            {
+                if (other == null)
+                {
+                    return;
+                }
+
+                foreach (MatchCandidate candidate in other.GetCandidates())
+                {
+                    Track(candidate);
+                }
+            }
+
+            public IEnumerable<MatchCandidate> GetCandidates()
+            {
+                foreach (List<MatchCandidate> cell in candidates)
+                {
+                    if (cell == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (MatchCandidate candidate in cell)
+                    {
+                        yield return candidate;
+                    }
+                }
+            }
+
+            private int GetIndex(double centerX, double centerY)
+            {
+                int column = ClampIndex((int)Math.Floor(((centerX - minCenterX) / width) * columns), columns);
+                int row = ClampIndex((int)Math.Floor(((centerY - minCenterY) / height) * rows), rows);
+                return (row * columns) + column;
+            }
+
+            private static int ClampIndex(int value, int count)
+            {
+                if (value < 0)
+                {
+                    return 0;
+                }
+
+                if (value >= count)
+                {
+                    return count - 1;
+                }
+
+                return value;
+            }
+        }
+
+        private static double GetPoseAngleDifference(double left, double right)
+        {
+            double difference = Math.Abs((left - right) % 360D);
+            return Math.Min(difference, 360D - difference);
+        }
+
+        private static double GetPoseRelativeScaleDifference(double left, double right) => Math.Max(left, right) / Math.Min(left, right) - 1D;
+
+        private sealed class MatchCandidate
+        {
+            public Point2d Center { get; set; }
+            public Point2d TemplateCenter { get; set; }
+            public RectangleF Bounds { get; set; }
+            public double Score { get; set; }
+            public bool HasContinuousPoseScore { get; set; }
+            public double ImageVerifyScore { get; set; } = double.NaN;
+            public double DescriptorVerifyScore { get; set; } = double.NaN;
+            public double HybridScore { get; set; } = double.NaN;
+            public bool PolarityReversed { get; set; }
+            public double Angle { get; set; }
+            public double Scale { get; set; } = 1D;
+            public int Width { get; set; }
+            public int Height { get; set; }
+        }
+
+        private sealed class CandidateDiagnostics
+        {
+            public int PoseRefinementAttemptCount { get; set; }
+            public int PoseRefinementAcceptedCount { get; set; }
+            public int PoseRefinementNativeFailureCount { get; set; }
+            public EdgeBasedMatchingCandidateDiagnostic SelectedCandidate { get; set; }
+            public EdgeBasedMatchingCandidateDiagnostic StrongestSpatialAlternative { get; set; }
+            public EdgeBasedMatchingCandidateDiagnostic StrongestPoseAlternative { get; set; }
+            public UniqueMatchState PoseMatchState { get; set; }
+            public int PoseMatchCheckedModelCount { get; set; }
+            public int PoseMatchEligibleAlternativeCount { get; set; }
+            public int PoseMatchPlausibleAlternativeCount { get; set; }
+            public int PoseMatchUnverifiedCandidateCount { get; set; }
+            public double PoseMatchSelectedScore { get; set; }
+            public double PoseMatchStrongestAlternativeScore { get; set; }
+            public double PoseMatchScoreMargin { get; set; }
+            public double PoseMatchAngleDifference { get; set; }
+            public double PoseMatchRelativeScaleDifference { get; set; }
+            public double PoseMatchDistanceThreshold { get; set; }
+            public UniqueMatchState UniqueMatchState { get; set; }
+            public int UniqueMatchPlausibleAlternativeCount { get; set; }
+            public double UniqueMatchSelectedScore { get; set; } = double.NegativeInfinity;
+            public double UniqueMatchStrongestAlternativeScore { get; set; } = double.NegativeInfinity;
+            public double UniqueMatchScoreMargin { get; set; } = double.NegativeInfinity;
+            public double UniqueMatchDistanceThreshold { get; set; } = double.NegativeInfinity;
+            public int ImageProposalCount { get; set; }
+            public int ImageProposalMissingCount { get; set; }
+            public int FastPathCount { get; set; }
+            public int FallbackSearchCount { get; set; }
+            public int EdgeSeedCount { get; set; }
+            public int EdgeSearchBestCount { get; set; }
+            public int HybridCandidateCount { get; set; }
+            public int HybridVerifiedCount { get; set; }
+            public int ImageProposalInVerificationCount { get; set; }
+            public int ImageProposalSelectedCount { get; set; }
+            public int FallbackSelectedCount { get; set; }
+            public int PyramidProposalAttemptCount { get; set; }
+            public int PyramidProposalAcceptedCount { get; set; }
+            public int PyramidProposalFallbackCount { get; set; }
+            public int PyramidProposalCandidateCount { get; set; }
+            public int PyramidProposalVerifiedCount { get; set; }
+            public int AmbiguousSelectionCount { get; set; }
+            public int AmbiguousAlternativeCount { get; set; }
+            public int SameScaleAmbiguousAlternativeCount { get; set; }
+            public int DifferentScaleAmbiguousAlternativeCount { get; set; }
+            public double MaxImageProposalEdgeScore { get; set; } = double.NegativeInfinity;
+            public double MaxImageProposalImageScore { get; set; } = double.NegativeInfinity;
+            public double MaxEdgeSearchScore { get; set; } = double.NegativeInfinity;
+            public double MaxPyramidProposalScore { get; set; } = double.NegativeInfinity;
+            public double MaxPyramidVerifiedScore { get; set; } = double.NegativeInfinity;
+            public double MaxAmbiguousAlternativeScore { get; set; } = double.NegativeInfinity;
+            public double MinAmbiguousScoreGap { get; set; } = double.PositiveInfinity;
+            public double MaxAmbiguousDistance { get; set; } = double.NegativeInfinity;
+            public double MaxAmbiguousScaleDelta { get; set; } = double.NegativeInfinity;
+        }
+
+        private enum UniqueMatchState
+        {
+            Disabled = 0,
+            NoMatch = 1,
+            Success = 2,
+            Ambiguous = 3
+        }
+
+        private sealed class HybridVerificationScore
+        {
+            public HybridVerificationScore(MatchCandidate candidate, double imageScore)
+            {
+                Candidate = candidate;
+                ImageScore = imageScore;
+            }
+
+            public MatchCandidate Candidate { get; }
+            public double ImageScore { get; }
+        }
+
+        private sealed class TemplateMatchLocation
+        {
+            public TemplateMatchLocation(OpenCvSharp.Point location, double score)
+            {
+                Location = location;
+                Score = score;
+            }
+
+            public OpenCvSharp.Point Location { get; }
+            public double Score { get; }
+        }
+    }
+}
+

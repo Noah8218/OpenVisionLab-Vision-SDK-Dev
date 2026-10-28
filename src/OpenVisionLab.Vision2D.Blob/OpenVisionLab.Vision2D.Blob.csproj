@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <PackageDescription>Blob labeling, area filtering, ROI, and result contracts for OpenVisionLab Vision2D.</PackageDescription>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="OpenCvSharp">
+      <HintPath>..\OpenVisionLab.Core\DLL\OpenCvSharp.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="README.md" Pack="true" PackagePath="" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\OpenVisionLab.Core\OpenVisionLab.Core.csproj" />
+    <ProjectReference Include="..\OpenVisionLab.Vision2D\OpenVisionLab.Vision2D.csproj" />
+  </ItemGroup>
+
+</Project>
