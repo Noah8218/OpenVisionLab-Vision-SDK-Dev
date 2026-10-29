@@ -5,7 +5,7 @@
   "contract": "Reviewed performance diagnostics after deterministic allocation cleanup",
   "expectedWarningsByCode": {
     "CA1805": 69,
-    "CA1822": 65,
+    "CA1822": 66,
     "CA1825": 0,
     "CA1843": 0,
     "CA1859": 3,
@@ -13,10 +13,10 @@
     "CA1869": 2
   },
   "reviewedClassification": {
-    "retainedTotal": 240,
+    "retainedTotal": 241,
     "decisionGroups": {
       "explicit-default": 69,
-      "public-instance-contract": 58,
+      "public-instance-contract": 59,
       "unmeasured-private-static": 7,
       "concrete-type-coupling": 3,
       "one-shot-mutable-array": 100,
@@ -33,7 +33,7 @@
     {
       "code": "CA1822",
       "decision": "retain",
-      "rationale": "Fifty-eight public instance contracts and seven private candidates are retained. Three stateful 3D Execute methods now read computeSession and are no longer static candidates; their owners and signatures are unchanged."
+      "rationale": "Fifty-nine public instance contracts and seven private candidates are retained. Three stateful 3D Execute methods now read computeSession and are no longer static candidates; their owners and signatures are unchanged. NinePointSurfaceCompensationTool.Execute retains its published public instance contract; making it static would break existing instance callers."
     },
     {
       "code": "CA1825",
@@ -476,6 +476,12 @@
       "identity": "CA1822|src/OpenVisionLab.Vision3D/FeatureExtraction/Filtering/DeterministicHeightDifferenceEdgeTool.cs|OpenVisionLab.Vision3D.FeatureExtraction.DeterministicHeightDifferenceEdgeTool|Execute|public HeightDifferenceEdgeResult Execute(|occurrence=1",
       "decisionGroup": "public-instance-contract",
       "source": "src/OpenVisionLab.Vision3D/FeatureExtraction/Filtering/DeterministicHeightDifferenceEdgeTool.cs"
+    },
+    {
+      "identity": "CA1822|src/OpenVisionLab.Vision3D/FeatureExtraction/Filtering/NinePointSurfaceCompensationTool.cs|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationTool|Execute|public NinePointSurfaceCompensationResult Execute(HeightMap3D source, NinePointSurfaceCompensationOptions options,|occurrence=1",
+      "decisionGroup": "public-instance-contract",
+      "source": "src/OpenVisionLab.Vision3D/FeatureExtraction/Filtering/NinePointSurfaceCompensationTool.cs",
+      "rationale": "The stateless tool uses per-call state. Preserve its published public instance Execute contract and existing instance callers instead of changing the API to static."
     },
     {
       "identity": "CA1822|src/OpenVisionLab.Vision3D/FeatureExtraction/Filtering/PointCloudBackgroundFilterTool.cs|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudBackgroundFilterTool|Execute|public PointCloudBackgroundFilterResult Execute(|occurrence=1",
