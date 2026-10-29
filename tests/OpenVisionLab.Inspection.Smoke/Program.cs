@@ -58,6 +58,7 @@ namespace OpenVisionLab.Inspection.Smoke
                 runner.Run(ThreeDSurfaceAndMetrologySmokeSuite.Cases());
                 runner.Run(SurfaceModelWorkflowSmokeSuite.Cases());
                 runner.Run(DatumPlaneFitSmokeSuite.Cases());
+                runner.Run(NinePointSurfaceCompensationSmokeSuite.Cases());
                 runner.Run(SurfacePoseRefinementSmokeSuite.Cases());
                 runner.Run(SurfaceChallengeEvaluationSmokeSuite.Cases());
                 runner.Run(SurfaceRobustnessSmokeSuite.Cases());

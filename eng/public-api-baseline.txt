@@ -219,6 +219,8 @@ C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.LineIntersecti
 C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.MeshDeviationStatistics|(System.Int64 count,System.Double minimum,System.Double maximum,System.Double mean,System.Double standardDeviationPopulation,System.Double rootMeanSquare)
 C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.MeshTriangle|(System.Int64 sourceTriangleIndex,OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint a,OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint b,OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint c)
 C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelKeyPointInput|(System.Int32 sourceSampleOrder,OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint position,OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint normal)
+C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationOptions|()
+C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationTool|()
 C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonOptions|(System.Int64 expectedPointCount,System.Double lowerTolerance,System.Double upperTolerance,System.Int32 maximumDisplaySamples)
 C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonProgress|(System.Int64 processedPointCount,System.Int64 totalPointCount)
 C|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonTool|()
@@ -693,6 +695,13 @@ F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelSurfaceRe
 F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelSurfaceRemovalReason|ExplicitInternal|OpenVisionLab.Vision3D.FeatureExtraction.ModelSurfaceRemovalReason|static,const|value=0
 F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelSurfaceRemovalReason|ExplicitUnobservable|OpenVisionLab.Vision3D.FeatureExtraction.ModelSurfaceRemovalReason|static,const|value=1
 F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelSurfaceRemovalReason|value__|System.Int32||
+F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|InvalidInput|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|static,const|value=1
+F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|InvalidReferenceGrid|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|static,const|value=2
+F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|MissingReferenceSample|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|static,const|value=3
+F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|None|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|static,const|value=0
+F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|NumericalFailure|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|static,const|value=4
+F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|value__|System.Int32||
+F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationTool|Semantics|System.String|static,const|value=nine-point-tensor-biquadratic-vertical-compensation-v1
 F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudBackgroundFilterMode|RemoveAtOrBelowDistance|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudBackgroundFilterMode|static,const|value=0
 F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudBackgroundFilterMode|value__|System.Int32||
 F|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudVoxelDownsampleTool|OutputOrderPolicyName|System.String|static,const|value=FirstSourceAppearance
@@ -1157,6 +1166,7 @@ M|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.LeastSquaresHe
 M|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.LevelFrameTool|Execute|OpenVisionLab.Vision3D.FeatureExtraction.LevelFrameResult|(OpenVisionLab.Vision3D.FeatureExtraction.LevelFramePlane plane,System.Threading.CancellationToken cancellationToken optional=<null>)|
 M|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.LevelSurfaceTool|Execute|OpenVisionLab.Vision3D.FeatureExtraction.LevelSurfaceResult|(System.Int32 rowCount,System.Int32 columnCount,System.Collections.Generic.IReadOnlyList<System.Double> values,System.Collections.Generic.IReadOnlyList<OpenVisionLab.Vision3D.FeatureExtraction.LevelSurfaceRegion> referenceRegions,OpenVisionLab.Vision3D.FeatureExtraction.LevelSurfaceOptions options,System.Threading.CancellationToken cancellationToken optional=<null>)|
 M|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.LineIntersectionTool|Execute|OpenVisionLab.Vision3D.FeatureExtraction.LineIntersectionResult|(OpenVisionLab.Vision3D.FeatureExtraction.ThreeDLineGeometry firstLine,OpenVisionLab.Vision3D.FeatureExtraction.ThreeDLineGeometry secondLine,OpenVisionLab.Vision3D.FeatureExtraction.LineIntersectionOptions options,System.Threading.CancellationToken cancellationToken optional=<null>)|
+M|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationTool|Execute|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|(OpenVisionLab.Vision3D.Geometry.HeightMap3D source,OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationOptions options,System.Threading.CancellationToken cancellationToken optional=<null>)|
 M|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonTool|Execute|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonResult|(System.Collections.Generic.IReadOnlyList<OpenVisionLab.Vision3D.FeatureExtraction.MeshTriangle> nominalTriangles,System.Collections.Generic.IEnumerable<OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint> queryPoints,OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonOptions options,System.IProgress<OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonProgress> progress optional=<null>,System.Threading.CancellationToken cancellationToken optional=<null>)|
 M|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudBackgroundFilterTool|Execute|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudBackgroundFilterResult|(System.Collections.Generic.IReadOnlyList<OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint> current,System.Collections.Generic.IReadOnlyList<OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint> savedBackground,OpenVisionLab.Vision3D.FeatureExtraction.PointCloudBackgroundFilterOptions options,System.Threading.CancellationToken cancellationToken optional=<null>)|
 M|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudVoxelDownsampleTool|Execute|OpenVisionLab.Vision3D.FeatureExtraction.PointCloudVoxelDownsampleResult|(System.Collections.Generic.IReadOnlyList<OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint> points,OpenVisionLab.Vision3D.FeatureExtraction.PointCloudVoxelDownsampleOptions options,System.Threading.CancellationToken cancellationToken optional=<null>)|
@@ -2800,6 +2810,31 @@ P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.MeshTriangle|S
 P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelKeyPointInput|Normal|OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint|index=|get|
 P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelKeyPointInput|Position|OpenVisionLab.Vision3D.FeatureExtraction.ThreeDPoint|index=|get|
 P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelKeyPointInput|SourceSampleOrder|System.Int32|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationOptions|OutputFrameId|System.String|index=|get,set|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationOptions|OutputSourceId|System.String|index=|get,set|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationOptions|ReferenceColumns|System.Collections.Generic.IReadOnlyList<System.Int32>|index=|get,set|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationOptions|ReferenceRows|System.Collections.Generic.IReadOnlyList<System.Int32>|index=|get,set|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationOptions|TargetHeight|System.Double|index=|get,set|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|BackgroundHeights|System.Collections.Generic.IReadOnlyList<System.Double>|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|ControlPoints|System.Collections.Generic.IReadOnlyList<OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence>|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|FailureReason|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|Input|OpenVisionLab.Vision3D.Geometry.HeightMap3D|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|Message|System.String|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|Output|OpenVisionLab.Vision3D.Geometry.HeightMap3D|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|PlaneHeightAtOrigin|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|PlaneSlopeX|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|PlaneSlopeY|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|ReferencePeakToValley|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|ReferenceRms|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|Success|System.Boolean|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|Column|System.Int32|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|CompensatedHeight|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|Height|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|PlaneResidual|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|ReferencePlaneHeight|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|Row|System.Int32|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|X|System.Double|index=|get|
+P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|Y|System.Double|index=|get|
 P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonOptions|ExpectedPointCount|System.Int64|index=|get|
 P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonOptions|LowerTolerance|System.Double|index=|get|
 P|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonOptions|MaximumDisplaySamples|System.Int32|index=|get|
@@ -3655,6 +3690,11 @@ T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.MeshDeviationS
 T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.MeshTriangle|class|sealed|base=System.Object|interfaces=|underlying=-
 T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelKeyPointInput|class|sealed|base=System.Object|interfaces=|underlying=-
 T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.ModelSurfaceRemovalReason|enum|sealed|base=System.Enum|interfaces=System.IComparable,System.IConvertible,System.IFormattable,System.ISpanFormattable|underlying=System.Int32
+T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationFailureReason|enum|sealed|base=System.Enum|interfaces=System.IComparable,System.IConvertible,System.IFormattable,System.ISpanFormattable|underlying=System.Int32
+T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationOptions|class|sealed|base=System.Object|interfaces=|underlying=-
+T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationResult|class|sealed|base=System.Object|interfaces=|underlying=-
+T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceCompensationTool|class|sealed|base=System.Object|interfaces=|underlying=-
+T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NinePointSurfaceControlEvidence|class|sealed|base=System.Object|interfaces=|underlying=-
 T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonOptions|class|sealed|base=System.Object|interfaces=|underlying=-
 T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonProgress|class|sealed|base=System.Object|interfaces=|underlying=-
 T|OpenVisionLab.Vision3D|OpenVisionLab.Vision3D.FeatureExtraction.NominalActualMeshComparisonResult|class|sealed|base=System.Object|interfaces=|underlying=-
