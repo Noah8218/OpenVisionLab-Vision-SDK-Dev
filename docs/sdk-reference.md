@@ -1,7 +1,7 @@
 # SDK reference
 
-The former root README's API examples, contracts, source setup, package notes,
-version history and illustration caveats are preserved below. For the short
+This reference covers API examples, contracts, source setup, package notes,
+version history and illustration caveats. For the short
 product introduction, see the [English README](../README.md) or [한국어 README](../README.ko.md).
 Commands and literal sample paths assume execution from the repository root.
 The existing [developer Start Here](README.md#start-here) retains its reading order.
@@ -23,7 +23,7 @@ It includes 2D image-processing tools, 3D feature extraction and measurement alg
 
 ## Version
 
-Current source version: `v3.2.0-rc.5` (prerelease).
+Current source version: `v3.3.0-rc.3` (prerelease).
 
 This project is maintained using explicit version numbers. The source version is
 defined in [`Directory.Build.props`](../Directory.Build.props). CLR assembly identity
@@ -31,6 +31,25 @@ remains `3.0.0.0` for 3.x compatibility. A source update does not imply that a N
 package or binary release has been published.
 
 ### Recent version history
+
+#### `v3.3.0-rc.3` (2026-11-16)
+
+- Validate active Matching grids and cap model generation while preserving configured angle bounds and worker ownership.
+- Bound frame Host cancellation callbacks, expire missing acquisitions and correlate terminal faults, rejections and cancellation.
+- Add opt-in Caliper quality metrics and exact-artifact/offline package consumers without changing existing public signatures or geometry success.
+
+#### `v3.3.0-rc.2` (2026-11-16)
+
+- Drain started Matching workers before releasing shared input/template data, keep Edge results on the current frame, and fit thickness reference planes from raw heights.
+- Add line/circle pixel calipers with immutable evidence and separate geometry/quality outcomes, plus a device-free frame Host with bounded ownership and safe recovery.
+- Extend cancellation, snapshot, package-only/offline and native-runtime checks while retaining existing public contracts and the earlier 3D compensation and physical-edge tools.
+
+#### `v3.3.0-rc.1` (2026-11-02)
+
+- Add nine-point background compensation with a separate output map and explicit reference-grid constraints.
+- Add signed physical-edge gap/flush results from caller-selected edge coordinates and paired scanlines.
+- Add cooperative cancellation overloads and checks in the affected 3D fitting, grid, thickness, flatness, volume, cross-section, warpage and raw-height-deviation paths while retaining existing entry points.
+- Preserve declared units, input ownership and normal numerical result contracts. Synthetic numerical checks do not establish sensor accuracy or a maximum cancellation latency.
 
 #### `v3.2.0-rc.5` (2026-10-12)
 
@@ -71,7 +90,7 @@ access to NuGet.org. Windows Server also needs the Media Foundation feature used
 the bundled OpenCV runtime.
 
 ```powershell
-git clone https://github.com/Noah8218/OpenVisionLab-Vision-SDK-Dev.git OpenVisionLab-Vision-SDK
+git clone https://github.com/Noah8218/OpenVisionLab-Vision-SDK.git OpenVisionLab-Vision-SDK
 Set-Location .\OpenVisionLab-Vision-SDK
 dotnet --version
 pwsh --version
@@ -133,10 +152,11 @@ assets together. Do not infer an available NuGet release from the source version
 ## First inspection example
 
 The [package-only console example](../samples/OpenVisionLab.FirstInspection/Program.cs)
-demonstrates teaching, locating a datum, moving ROIs, checking presence and measuring an edge in pixels. It uses Windows x64/.NET 8 and the transitive dependencies of
-`OpenVisionLab.Vision2D.Blob`. Copy its
+demonstrates teaching, locating a datum, moving ROIs, checking presence and measuring an edge in pixels. It uses Windows x64/.NET 8 and directly references
+`OpenVisionLab.Vision2D.Blob` and `OpenVisionLab.Inspection`, with their transitive dependencies. Copy its
 [project file](../samples/OpenVisionLab.FirstInspection/OpenVisionLab.FirstInspection.csproj)
-and `Program.cs` to an independent directory, or build it in this checkout.
+and every C# source file in that directory to an independent directory, or build
+it in this checkout. The project file selects the required package references.
 Select an exact, immutable package version from a feed you are authorized to use;
 the source version does not indicate package availability. Keep the managed
 OpenCvSharp and native OpenCV assets supplied by Core together. Current
@@ -144,7 +164,7 @@ OpenCvSharp and native OpenCV assets supplied by Core together. Current
 still apply.
 
 Choose an absolute writable work path for generated data, output and temporary files. The commands below start from the checkout root.
-After copying the two files to an independent directory, run there and set
+After copying the project and its C# source files to an independent directory, run there and set
 `$sampleProject` to `"./OpenVisionLab.FirstInspection.csproj"` instead. `prepare` requires an empty
 directory and `teach` requires a new destination filename.
 
@@ -220,7 +240,7 @@ as a percentage and `ScoreMin` as a 0..1 threshold (0.9 means 90%). Read
 `Stages` to distinguish location failure from mark absence or invalid input.
 Exit `0` means the command succeeded, `2` is a
 completed inspection reporting absence or rejection, `3` is invalid input/settings
-or file failure, and `130` is cancellation. `Accepted` means the example produced all required inspection results; the application owns the equipment decision.
+or backend/worker/file failure, and `130` is cancellation of that execution. `Accepted` means the example produced all required inspection results; the application owns the equipment decision.
 Missing/unexecuted measurements are null. `Line` expresses the global pixel line
 `x = Slope * y + InterceptPx`; `BlobAreaPx` counts pixels in the detected mark.
 The authored reference and analytic
@@ -237,7 +257,7 @@ in progress may finish before cancellation is observed. Saving never overwrites
 an existing bundle and cleans its own temporary file after failure/cancellation.
 
 For a local package feed, the focused
-[consumer check](../eng/Test-FirstInspectionSample.ps1) copies just the two source
+[consumer check](../eng/Test-FirstInspectionSample.ps1) copies the sample project and its C# source
 files, clears other package sources, uses an isolated cache, and verifies
 known answers, corruption, save/restore, cancellation and optional CUDA fallback.
 Its required parameters are `-PackageDirectory`, `-ExpectedVersion` and
@@ -245,6 +265,56 @@ Its required parameters are `-PackageDirectory`, `-ExpectedVersion` and
 version and restoration-recovery gate. `-CudaModule` optionally supplies a compatible native module
 for that owned test output. These automated checks do not establish first-use
 usability, field accuracy or performance superiority.
+
+### Device-free frame Host
+
+The same package-only example has an explicit acquisition/inspection/teaching
+workflow without a camera dependency. Build the complete sample as above and
+choose new input/output directories:
+
+```powershell
+dotnet $sample host prepare "$workRoot/host-input"
+dotnet $sample host load "$workRoot/host-input/host.json"
+dotnet $sample host run "$workRoot/host-input/host.json" "$workRoot/host-output"
+```
+
+`prepare` writes a padded Gray16LE synthetic frame and settings; `load` validates
+and restores them without connection, inspection or a CUDA probe. `run` executes
+the real caliper Tool and writes correlated raw, Gray8, opaque RGBA preview,
+teaching and result artifacts. Raw bytes and display conversion stay distinct.
+The JSON preserves shot/frame/camera IDs, clock domains, settings/model revisions,
+coordinates, hashes and shutdown evidence. The prepared continuous profile runs
+three shots; an explicitly selected single-shot profile runs one.
+
+Terminal JSON uses additive `SchemaVersion=2`. `CommandId` identifies the command;
+`ShotId` identifies each accepted frame, including failed/canceled shots. `Outcome`
+provides `Execution`, `MeasurementEstablished`, `Decision`, `FailureStage` and the
+original `ErrorCode`/`ErrorType`/`ErrorMessage` where applicable. `MachineDecision`
+remains `NotProvided`. For multiple shots, fault/acquisition timeout takes priority
+over cancellation, then completed rejection, then pass; individual evidence remains.
+
+New profiles set `AcquisitionTimeoutMilliseconds=5000`; omitted/zero in older
+profiles retains the unlimited acquisition setting. A monotonic clock expires a
+missing callback with `AcquisitionTimeout`, no measurement and `NotEvaluated`.
+Late frames cannot commit a second terminal. A timed-out receiving copy retains
+its raw-byte reservation until the copy completes; `MaximumRawBytes` describes
+session reservations, not total process or consumer-retained result memory.
+
+Queues include pending triggers and retained frames. Callback buffers are copied
+before returning; late callbacks from an older generation cannot publish a new
+result. A stop deadline retains outstanding ownership rather than disposing
+active work. Cancellation callbacks share the same overall stop deadline. An
+incomplete stop retains its generation's owners and prevents restart/disposal;
+retry observes the same cancellation operation. Callback faults remain shutdown
+errors even after all owners quiesce. A failed producer stop requires an explicit
+successful retry. Only cancellation of the current generation classifies a worker
+`OperationCanceledException` as canceled; unrelated cancellation exceptions are faults.
+Cancellation uses exit130/`Canceled` with no approved measurement; settings and
+confirmed outputs are preserved. Use a new output directory on every run.
+
+These are device-free software contracts. The packed10/12 row formats implemented
+by the sample are explicitly local formats, not vendor PFNC. No camera driver,
+physical calibration, desktop rendering or machine acceptance is provided.
 
 ### QR configure, restore and explicit inspection
 

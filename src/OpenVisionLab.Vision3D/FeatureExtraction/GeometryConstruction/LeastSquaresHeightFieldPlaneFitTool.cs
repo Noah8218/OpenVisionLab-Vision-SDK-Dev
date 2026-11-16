@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace OpenVisionLab.Vision3D.FeatureExtraction
 {
@@ -24,6 +25,11 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
     {
         private readonly ThreeDPoint referenceOrigin;
         private readonly double localIntercept;
+        private readonly bool hasRawPlane;
+        private readonly double rawOrigin;
+        private readonly double rawSlopeX;
+        private readonly double rawSlopeZ;
+        private readonly double rawLocalIntercept;
 
         public LeastSquaresHeightFieldPlaneFitResult(
             double slopeX,
@@ -67,12 +73,17 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
             double targetRawHeight,
             double targetRawReferenceHeight,
             ThreeDPoint referenceOrigin,
-            double localIntercept)
+            double localIntercept, double rawOrigin, double rawSlopeX, double rawSlopeZ, double rawLocalIntercept)
             : this(slopeX, slopeZ, intercept, normal, offset, sampleCount, rootMeanSquareDistance,
                 target, targetProjection, targetSignedDistance, targetRawHeight, targetRawReferenceHeight)
         {
             this.referenceOrigin = referenceOrigin;
             this.localIntercept = localIntercept;
+            this.rawOrigin = rawOrigin;
+            this.rawSlopeX = rawSlopeX;
+            this.rawSlopeZ = rawSlopeZ;
+            this.rawLocalIntercept = rawLocalIntercept;
+            hasRawPlane = true;
         }
 
         public double SlopeX { get; }
@@ -96,6 +107,14 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
                 ? (SlopeX * x) + (SlopeZ * z) + Intercept
                 : referenceOrigin.Y + ((SlopeX * (x - referenceOrigin.X)) + (SlopeZ * (z - referenceOrigin.Z)) + localIntercept);
         }
+        internal bool TryEvaluateRawHeight(double x, double z, out double value)
+        {
+            value = hasRawPlane
+                ? rawOrigin + ((rawSlopeX * (x - referenceOrigin.X)) + (rawSlopeZ * (z - referenceOrigin.Z)) + rawLocalIntercept)
+                : double.NaN;
+            return !double.IsNaN(value) && !double.IsInfinity(value);
+        }
+
         internal double SignedDistance(ThreeDPoint point)
         {
             return referenceOrigin == null
@@ -113,6 +132,14 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
     {
         public LeastSquaresHeightFieldPlaneFitResult Execute(IReadOnlyList<HeightFieldPlaneFitSample> samples)
         {
+            return Execute(samples, default(CancellationToken));
+        }
+
+        public LeastSquaresHeightFieldPlaneFitResult Execute(
+            IReadOnlyList<HeightFieldPlaneFitSample> samples,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             if (samples == null)
             {
                 throw new ArgumentNullException(nameof(samples));
@@ -124,6 +151,7 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
             }
 
             HeightFieldPlaneFitSample origin = samples[0];
+            cancellationToken.ThrowIfCancellationRequested();
             if (!IsFinite(origin))
             {
                 throw new ArgumentException("Plane fitting samples must contain finite coordinates and raw heights.", nameof(samples));
@@ -135,6 +163,7 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
             double meanRaw = 0.0;
             foreach (HeightFieldPlaneFitSample sample in samples)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!IsFinite(sample))
                 {
                     throw new ArgumentException("Plane fitting samples must contain finite coordinates and raw heights.", nameof(samples));
@@ -146,6 +175,7 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
                 meanRaw += sample.RawHeight - origin.RawHeight;
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             meanX /= samples.Count;
             meanY /= samples.Count;
             meanZ /= samples.Count;
@@ -155,6 +185,7 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
                 throw new InvalidOperationException("Plane fitting produced a non-finite sample mean.");
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             double sumXX = 0.0;
             double sumXZ = 0.0;
             double sumZZ = 0.0;
@@ -164,6 +195,7 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
             double sumZRaw = 0.0;
             foreach (HeightFieldPlaneFitSample sample in samples)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 double x = (sample.Position.X - origin.Position.X) - meanX;
                 double y = (sample.Position.Y - origin.Position.Y) - meanY;
                 double z = (sample.Position.Z - origin.Position.Z) - meanZ;
@@ -177,6 +209,7 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
                 sumZRaw += z * raw;
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             if (!IsFinite(sumXX) || !IsFinite(sumXZ) || !IsFinite(sumZZ)
                 || !IsFinite(sumXY) || !IsFinite(sumZY)
                 || !IsFinite(sumXRaw) || !IsFinite(sumZRaw))
@@ -224,6 +257,7 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
             double offset = -intercept / normalLength;
 
             HeightFieldPlaneFitSample target = samples[0];
+            cancellationToken.ThrowIfCancellationRequested();
             double targetSignedDistance = SignedDistance(target.Position, normal, origin.Position, localIntercept);
             double squaredDistanceSum = targetSignedDistance * targetSignedDistance;
             if (!IsFinite(targetSignedDistance) || !IsFinite(squaredDistanceSum))
@@ -233,6 +267,7 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
 
             for (int index = 1; index < samples.Count; index++)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 double signedDistance = SignedDistance(samples[index].Position, normal, origin.Position, localIntercept);
                 double squaredDistance = signedDistance * signedDistance;
                 if (!IsFinite(signedDistance) || !IsFinite(squaredDistance))
@@ -253,24 +288,35 @@ namespace OpenVisionLab.Vision3D.FeatureExtraction
                 }
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             ThreeDPoint projection = Project(target.Position, normal, targetSignedDistance);
             double rawReference = origin.RawHeight + ((rawSlopeX * (target.Position.X - origin.Position.X))
                 + (rawSlopeZ * (target.Position.Z - origin.Position.Z)) + rawIntercept);
-            return new LeastSquaresHeightFieldPlaneFitResult(
+            double rootMeanSquareDistance = Math.Sqrt(squaredDistanceSum / samples.Count);
+            if (!normal.IsFinite || !IsFinite(offset) || !projection.IsFinite
+                || !IsFinite(rootMeanSquareDistance) || !IsFinite(rawReference)
+                || !IsFinite(target.RawHeight - rawReference))
+            {
+                throw new InvalidOperationException("Plane fitting produced non-finite final evidence.");
+            }
+
+            var result = new LeastSquaresHeightFieldPlaneFitResult(
                 slopeX,
                 slopeZ,
                 intercept,
                 normal,
                 offset,
                 samples.Count,
-                Math.Sqrt(squaredDistanceSum / samples.Count),
+                rootMeanSquareDistance,
                 target.Position,
                 projection,
                 targetSignedDistance,
                 target.RawHeight,
                 rawReference,
                 origin.Position,
-                localIntercept);
+                localIntercept, origin.RawHeight, rawSlopeX, rawSlopeZ, rawIntercept);
+            cancellationToken.ThrowIfCancellationRequested();
+            return result;
         }
 
         internal static double SignedDistance(ThreeDPoint point, ThreeDPoint normal, double offset)
